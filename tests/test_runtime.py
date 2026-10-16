@@ -142,3 +142,18 @@ def test_initializer_refuses_existing_subroot_and_missing_owner(tmp_path):
     initialize(root, "ledger")
     with pytest.raises(RuntimeErrorSafe, match="already exists"):
         initialize(root, "ledger")
+
+
+def test_torch_bare_uuid_matches_nvml_identity_but_not_other_device(tmp_path):
+    from head_sharing.runtime import canonical_gpu_uuid
+    ledger = AllocationLedger(owned(tmp_path))
+    token = ledger.reserve(GPU_UUIDS[1], 120, phase='main', cpus=1)
+    ledger.update_job(token, status='running')
+    assert canonical_gpu_uuid(GPU_UUIDS[1][4:]) == GPU_UUIDS[1]
+    assert canonical_gpu_uuid(GPU_UUIDS[1]) == GPU_UUIDS[1]
+    assert ledger.validate_device(token, GPU_UUIDS[1][4:])
+    with pytest.raises(RuntimeErrorSafe, match='device'):
+        ledger.validate_device(token, GPU_UUIDS[0][4:])
+    for invalid in ('', 'GPU-unknown', GPU_UUIDS[1].replace('-', ''), None):
+        with pytest.raises(RuntimeErrorSafe, match='UUID'):
+            canonical_gpu_uuid(invalid)

@@ -27,6 +27,19 @@ class RuntimeErrorSafe(RuntimeError):
     """An allocation or ownership invariant failed; callers must stop."""
 
 
+def canonical_gpu_uuid(value: str) -> str:
+    """Unify PyTorch's bare UUID and NVML's GPU-prefixed physical identity."""
+    if not isinstance(value, str):
+        raise RuntimeErrorSafe("invalid GPU UUID representation")
+    raw = value.removeprefix("GPU-")
+    if len(raw) != 36 or any(raw[i] != "-" for i in (8, 13, 18, 23)):
+        raise RuntimeErrorSafe("invalid GPU UUID representation")
+    try:
+        return "GPU-" + str(uuid.UUID(raw))
+    except ValueError as exc:
+        raise RuntimeErrorSafe("invalid GPU UUID representation") from exc
+
+
 def _is_link_or_junction(path: Path) -> bool:
     return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
 
@@ -146,7 +159,7 @@ class AllocationLedger:
     def validate_device(self, token: str, actual_uuid: str, *, cuda_module=None):
         """Validate the exact reserved physical UUID from a guarded child."""
         job = self.get_job(token)
-        if job["status"] not in {"launching", "running"} or actual_uuid != job["uuid"]:
+        if job["status"] not in {"launching", "running"} or canonical_gpu_uuid(actual_uuid) != job["uuid"]:
             raise RuntimeErrorSafe("device does not match active reservation")
         return True
 

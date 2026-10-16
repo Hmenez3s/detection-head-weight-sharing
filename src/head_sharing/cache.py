@@ -327,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"; producer = "cpu"; progress_path = None
     else:
         if not all((args.owned_root, args.ledger, args.reservation)): parser.error("GPU mode requires --owned-root, --ledger, and --reservation")
-        from .runtime import AllocationLedger, _has_symlink_component
+        from .runtime import AllocationLedger, _has_symlink_component, canonical_gpu_uuid
         from .supervisor import child_entry
         owned_root = Path(args.owned_root)
         if (_has_symlink_component(owned_root) or not owned_root.is_dir() or owned_root.absolute() != owned_root.resolve(strict=True) or not (owned_root/"STUDY_OWNER.txt").is_file()): raise RuntimeError("GPU mode requires canonical owned study root")
@@ -340,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         if os.environ.get("CUDA_VISIBLE_DEVICES") != args.device: raise RuntimeError("GPU visibility differs from reservation")
         import torch
         if not torch.cuda.is_available(): raise RuntimeError("reserved CUDA device unavailable")
-        actual_uuid = str(getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "uuid", ""))
+        actual_uuid = canonical_gpu_uuid(str(getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "uuid", "")))
         if actual_uuid != args.device: raise RuntimeError("actual torch CUDA UUID differs from reservation")
         ledger.validate_device(args.reservation, actual_uuid); producer = actual_uuid
         _progress(progress_path, "native_import_complete", 1, 1)
