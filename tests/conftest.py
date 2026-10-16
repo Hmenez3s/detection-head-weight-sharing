@@ -13,7 +13,7 @@ for key in ("YOLO_CONFIG_DIR", "TORCH_HOME", "MPLCONFIGDIR", "XDG_CACHE_HOME", "
         raise RuntimeError(f"{key} is outside owned test root")
 if not (Path(os.environ["YOLO_CONFIG_DIR"]) / "Ultralytics").is_dir():
     raise RuntimeError("Ultralytics config child was not precreated")
-if os.environ.get("CUDA_VISIBLE_DEVICES") != "" or os.environ.get("YOLO_OFFLINE") != "true":
+if os.environ.get("CUDA_VISIBLE_DEVICES") != "-1" or os.environ.get("YOLO_OFFLINE") != "true":
     raise RuntimeError("CPU/offline test environment is not active")
 
 def _deny_network(*args, **kwargs):

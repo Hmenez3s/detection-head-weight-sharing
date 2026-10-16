@@ -81,7 +81,7 @@ def main() -> int:
             value.mkdir(parents=True, exist_ok=True)
             env[key] = str(value)
         (root / "yolo" / "Ultralytics").mkdir()
-        env.update(CUDA_VISIBLE_DEVICES="", YOLO_OFFLINE="true", PYTHONPATH="src",
+        env.update(CUDA_VISIBLE_DEVICES="-1", YOLO_OFFLINE="true", PYTHONPATH="src",
                    OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
                    NUMEXPR_NUM_THREADS="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
                    PYTHONDONTWRITEBYTECODE="1", HEAD_SHARING_TEST_ROOT=str(root))
