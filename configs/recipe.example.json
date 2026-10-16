@@ -4,7 +4,7 @@
   "arms": ["native", "independent_k2", "shared_k2"],
   "gpu_for_seed": {"11": null, "22": null, "33": null, "44": null, "55": null},
   "selection": {"cohort": "dev", "metric": "AP50:95", "tie": "earliest", "training_length": "fixed_epochs"},
-  "numeric_policy": {"trunk_dtype": "float32", "feature_storage_dtype": "float16", "head_input_dtype": "float32", "head_train_autocast": "bfloat16", "metric_head_dtype": "float32", "NVIDIA_TF32_OVERRIDE": "0", "CUBLAS_WORKSPACE_CONFIG": ":4096:8"},
+  "numeric_policy": {"trunk_dtype": "float32", "feature_storage_dtype": "float16", "head_input_dtype": "float32", "head_train_autocast": "bfloat16", "metric_head_dtype": "float32", "NVIDIA_TF32_OVERRIDE": "0", "CUBLAS_WORKSPACE_CONFIG": ":4096:8", "cuda_matmul_allow_tf32": false, "cudnn_allow_tf32": true, "cudnn_benchmark": false, "cudnn_deterministic": false, "deterministic_algorithms": false},
   "imgsz": null,
   "batch_size": null,
   "epochs": null,

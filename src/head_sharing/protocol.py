@@ -6,7 +6,7 @@ from pathlib import Path
 SEEDS=[11,22,33,44,55]
 ARMS=["native","independent_k2","shared_k2"]
 SELECTION={"cohort":"dev","metric":"AP50:95","tie":"earliest","training_length":"fixed_epochs"}
-NUMERIC_POLICY={"trunk_dtype":"float32","feature_storage_dtype":"float16","head_input_dtype":"float32","head_train_autocast":"bfloat16","metric_head_dtype":"float32","NVIDIA_TF32_OVERRIDE":"0","CUBLAS_WORKSPACE_CONFIG":":4096:8"}
+NUMERIC_POLICY={"trunk_dtype":"float32","feature_storage_dtype":"float16","head_input_dtype":"float32","head_train_autocast":"bfloat16","metric_head_dtype":"float32","NVIDIA_TF32_OVERRIDE":"0","CUBLAS_WORKSPACE_CONFIG":":4096:8","cuda_matmul_allow_tf32":False,"cudnn_allow_tf32":True,"cudnn_benchmark":False,"cudnn_deterministic":False,"deterministic_algorithms":False}
 REQUIRED_RECIPE={"status","seed_list","arms","imgsz","batch_size","epochs","cadence","block_size","probe_size","optimizer","gains","quantization","producer","environment","trunk_sha256","split_sha256","cache_evidence","pilot_evidence","synthetic","gpu_for_seed","selection","numeric_policy"}
 
 

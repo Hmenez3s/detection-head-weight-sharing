@@ -4,7 +4,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import random
+import os
+import tempfile
 from pathlib import Path
+
+import numpy as np
 from typing import Any
 
 import torch
@@ -114,7 +119,7 @@ def save_checkpoint(model: HeadStudyModel, weights_path: str | Path, config_path
     validate_trunk_receipt(trunk_receipt)
     weights_path, config_path = Path(weights_path), Path(config_path)
     state = _cpu_head_state(model)
-    torch.save(state, weights_path)
+    _atomic_save(state, weights_path)
     config = {"format": 1, "architecture": model.architecture, "arm": model.arm, "seed": model.seed,
               "imgsz": model.imgsz, "quantization": model.quantization, "trunk_receipt": trunk_receipt}
     config_path.write_text(json.dumps(config, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -168,22 +173,118 @@ def load_checkpoint(weights_path: str | Path, config_path: str | Path, *, trunk_
     return model
 
 
-def save_resume(model: HeadStudyModel, optimizer: torch.optim.Optimizer, path: str | Path, *, epoch: int) -> None:
+def _rng_state():
+    py = random.getstate()
+    np_state = np.random.get_state()
+    state = {"python": [py[0], list(py[1]), py[2]],
+             "numpy": [np_state[0], torch.from_numpy(np_state[1].copy()), int(np_state[2]), int(np_state[3]), float(np_state[4])],
+             "torch_cpu": torch.get_rng_state()}
+    if torch.cuda.is_available(): state["torch_cuda"] = [x.cpu() for x in torch.cuda.get_rng_state_all()]
+    return state
+
+
+def _validate_rng(state):
+    if not isinstance(state, dict) or not {'python', 'numpy', 'torch_cpu'} <= set(state) or set(state)-{'python', 'numpy', 'torch_cpu', 'torch_cuda'}:
+        raise ValueError('invalid resume RNG state')
+    p, n = state['python'], state['numpy']
+    try:
+        if not isinstance(p, list) or len(p) != 3 or not isinstance(n, list) or len(n) != 5 or not isinstance(n[1], torch.Tensor):
+            raise ValueError('invalid resume RNG payload')
+        random.Random().setstate((p[0], tuple(p[1]), p[2]))
+        np.random.RandomState().set_state((n[0], n[1].cpu().numpy().astype(np.uint32), n[2], n[3], n[4]))
+        torch.Generator(device='cpu').set_state(state['torch_cpu'])
+        if 'torch_cuda' in state:
+            values = state['torch_cuda']
+            if not isinstance(values, list) or any(not isinstance(x, torch.Tensor) or x.dtype != torch.uint8 or x.ndim != 1 for x in values):
+                raise ValueError('invalid CUDA RNG payload')
+            if torch.cuda.is_available() and len(values) != torch.cuda.device_count():
+                raise ValueError('resume CUDA RNG device count mismatch')
+    except (TypeError, KeyError, RuntimeError, ValueError) as exc:
+        raise ValueError('invalid resume RNG payload') from exc
+
+
+def _restore_rng(state):
+    if not isinstance(state, dict) or not {"python", "numpy", "torch_cpu"} <= set(state) or set(state)-{"python", "numpy", "torch_cpu", "torch_cuda"}:
+        raise ValueError("invalid resume RNG state")
+    p, n = state["python"], state["numpy"]
+    if not isinstance(p, list) or len(p) != 3 or not isinstance(n, list) or len(n) != 5 or not isinstance(n[1], torch.Tensor):
+        raise ValueError("invalid resume RNG payload")
+    random.setstate((p[0], tuple(p[1]), p[2]))
+    np.random.set_state((n[0], n[1].cpu().numpy().astype(np.uint32), n[2], n[3], n[4]))
+    torch.set_rng_state(state["torch_cpu"])
+    if "torch_cuda" in state and torch.cuda.is_available(): torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _primitive_state(value):
+    if value is None or type(value) in (str, int, float, bool) or isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_primitive_state(x) for x in value)
+    if isinstance(value, dict):
+        return all(type(k) in (str, int) and _primitive_state(v) for k, v in value.items())
+    return False
+
+
+def _atomic_save(payload, path):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix='.resume-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            torch.save(payload, stream)
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+
+def resume_training_state(path):
+    """Read progress from the authoritative tensor-only epoch-boundary file."""
+    try:
+        payload = torch.load(path, map_location='cpu', weights_only=True)
+    except (OSError, RuntimeError, EOFError) as exc:
+        raise ValueError('invalid resume checkpoint') from exc
+    state = payload.get('training_state') if isinstance(payload, dict) else None
+    if not isinstance(state, dict) or not _primitive_state(state):
+        raise ValueError('invalid resume training state')
+    return state
+
+
+def save_resume(model: HeadStudyModel, optimizer: torch.optim.Optimizer, path: str | Path, *, epoch: int,
+                training_state: dict | None = None) -> None:
     if epoch < 0:
         raise ValueError("epoch must be non-negative")
-    torch.save({"model": _cpu_head_state(model), "optimizer": optimizer.state_dict(), "epoch": epoch}, path)
+    if training_state is not None and (not isinstance(training_state, dict) or not _primitive_state(training_state)):
+        raise ValueError("training state must contain only primitives and tensors")
+    _atomic_save({"model": _cpu_head_state(model), "optimizer": optimizer.state_dict(), "epoch": epoch,
+                "training_state": training_state, "rng": _rng_state()}, path)
 
 
-def load_resume(model: HeadStudyModel, optimizer: torch.optim.Optimizer, path: str | Path) -> int:
+def load_resume(model: HeadStudyModel, optimizer: torch.optim.Optimizer, path: str | Path, *,
+                expected_state: dict | None = None, restore_rng: bool = True) -> int:
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
     except (OSError, RuntimeError, EOFError) as exc:
         raise ValueError("invalid resume checkpoint") from exc
-    if not isinstance(payload, dict) or set(payload) != {"model", "optimizer", "epoch"}:
+    if not isinstance(payload, dict) or set(payload) not in ({"model", "optimizer", "epoch"}, {"model", "optimizer", "epoch", "training_state", "rng"}):
         raise ValueError("invalid resume checkpoint structure")
+    training_state = payload.get('training_state')
+    if training_state is not None and (not isinstance(training_state, dict) or not _primitive_state(training_state)):
+        raise ValueError('invalid resume training state')
+    if expected_state is not None and (not isinstance(training_state, dict) or
+            any(training_state.get(k) != v for k, v in expected_state.items())):
+        raise ValueError("resume protocol/training binding mismatch")
+    if "rng" in payload:
+        # Validate before applying model/optimizer state.
+        _validate_rng(payload['rng'])
     epoch = payload["epoch"]
     if type(epoch) is not int or epoch < 0:
         raise ValueError("invalid resume epoch")
+    if training_state is not None:
+        target = training_state.get('target_epochs')
+        if target is not None and (type(target) is not int or not 0 <= epoch <= target):
+            raise ValueError('resume epoch exceeds immutable target')
+        if 'history' in training_state and (not isinstance(training_state['history'], list) or len(training_state['history']) != epoch):
+            raise ValueError('resume curve does not cover completed epochs')
     optimizer_state = payload["optimizer"]
     if not isinstance(optimizer_state, dict) or set(optimizer_state) != {"state", "param_groups"}:
         raise ValueError("invalid resume optimizer state")
@@ -200,6 +301,27 @@ def load_resume(model: HeadStudyModel, optimizer: torch.optim.Optimizer, path: s
     for group in (group for group in head_alias_groups if len(group) > 1):
         if any(not torch.equal(state[group[0]], state[k]) for k in group[1:]):
             raise ValueError("conflicting duplicate tensors for aliased module state")
+    groups = optimizer_state['param_groups']
+    current = optimizer.param_groups
+    if not isinstance(groups, list) or len(groups) != len(current) or any(
+            not isinstance(g, dict) or not isinstance(g.get('params'), list) or len(g['params']) != len(c['params']) or any(type(pid) is not int for pid in g['params'])
+            for g, c in zip(groups, current)):
+        raise ValueError('resume optimizer group topology mismatch')
+    for group, existing in zip(groups, current):
+        if any(group.get(k) != v for k, v in existing.items() if k not in ('params', 'lr', 'initial_lr')):
+            raise ValueError('resume optimizer fixed policy mismatch')
+        if type(group.get('lr')) not in (int, float) or not __import__('math').isfinite(group['lr']) or group['lr'] < 0:
+            raise ValueError('invalid resume learning rate')
+    parameters = {pid: parameter for g, c in zip(groups, current) for pid, parameter in zip(g['params'], c['params'])}
+    if len(parameters) != sum(len(g['params']) for g in groups) or not isinstance(optimizer_state['state'], dict) or not set(optimizer_state['state']) <= set(parameters):
+        raise ValueError('resume optimizer parameter identity mismatch')
+    for pid, values in optimizer_state['state'].items():
+        if not isinstance(values, dict) or not _primitive_state(values): raise ValueError('invalid optimizer state')
+        if 'momentum_buffer' in values:
+            buffer = values['momentum_buffer']; parameter = parameters[pid]
+            if not isinstance(buffer, torch.Tensor) or buffer.shape != parameter.shape or buffer.dtype != parameter.dtype:
+                raise ValueError('resume momentum topology mismatch')
     optimizer.load_state_dict(optimizer_state)
     model.detect.load_state_dict(state, strict=True)
+    if restore_rng and "rng" in payload: _restore_rng(payload["rng"])
     return epoch
