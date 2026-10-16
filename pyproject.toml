@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "head-sharing"
+version = "0.1.0"
+description = "Controlled head-only weight-sharing study scaffold"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "torch==2.9.1",
+  "torchvision==0.24.1",
+  "ultralytics==8.4.177",
+  "pycocotools==2.0.11",
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.4.2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
