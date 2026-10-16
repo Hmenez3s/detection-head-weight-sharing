@@ -111,7 +111,7 @@ raise SystemExit(pytest.main(["-p", "no:cacheprovider", *%r]))
         if proc is not None:
             _reap_group(proc)
         if inventory() != before:
-            print("ERROR: frozen /tmp/Ultralytics postcheck differs", file=sys.stderr)
+            raise RuntimeError("frozen /tmp/Ultralytics changed during cleanup; evidence retained")
         shutil.rmtree(root)
         try:
             parent.rmdir()
