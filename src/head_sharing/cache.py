@@ -346,6 +346,10 @@ def main(argv: list[str] | None = None) -> int:
         _progress(progress_path, "native_import_complete", 1, 1)
     from .model import HeadStudyModel
     import torch
+    import cv2
+    cpu_budget = int(os.environ.get("HEAD_SHARING_CPU_BUDGET", "1"))
+    torch.set_num_threads(cpu_budget)
+    cv2.setNumThreads(cpu_budget)
     if args.command == "compare" and producer != args.expected_producer: raise ValueError("comparison must run on cache producer")
     model = HeadStudyModel(imgsz=args.imgsz).to("cpu" if args.device == "cpu" else "cuda").eval()
     receipt = _read_json(Path(args.receipt))
