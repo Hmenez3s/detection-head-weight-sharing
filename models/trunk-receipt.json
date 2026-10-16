@@ -1,0 +1,16 @@
+{
+  "head_index": 23,
+  "input_channels": [
+    64,
+    128,
+    256
+  ],
+  "pre_exposure": "Source trunk trained from scratch on the same 11,629 COCO2017 train images for 80 epochs; native source augmentation. No source head weights reused.",
+  "source_epoch_zero_based": 79,
+  "source_seed": 11,
+  "source_training_epochs": 80,
+  "source_variant": "U",
+  "trunk_artifact_sha256": "f01ec41445fac9ef7078b48ef1b73473e6314bcb1a77e77c20666d6ecfcd9016",
+  "trunk_bytes": 9109168,
+  "trunk_tensors": 468
+}
