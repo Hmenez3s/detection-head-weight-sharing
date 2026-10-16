@@ -277,7 +277,11 @@ def _progress(path: str | Path | None, phase: str, done: int, total: int):
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps({"phase": phase, "done": done, "total": total, "time": time.time()}) + "\n")
-        stream.flush(); os.fsync(stream.fileno())
+        stream.flush()
+        # Heartbeats need cross-process visibility, not a physical disk flush per
+        # image. Allocation accounting and finalized cache metadata remain durable.
+        if phase in ("hashed_complete", "cache_complete"):
+            os.fsync(stream.fileno())
 
 
 def compare_cache(model, images, features: list, *, atol: float, rtol: float, geometry_max_abs: float = 0.0):

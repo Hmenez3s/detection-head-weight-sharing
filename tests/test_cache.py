@@ -146,3 +146,17 @@ def test_read_time_excludes_consumer_and_open_reports_hash_progress(tmp_path, mo
         for _ in cache.read_blocks(reader, 'few', metadata['block_order']['few'], batch_size=3):
             clock[0] += 10.0  # Consumer time must not be attributed to cache I/O.
         assert reader.read_seconds == 0.0
+
+
+def test_heartbeat_visibility_does_not_flush_each_image_but_completion_is_durable(tmp_path, monkeypatch):
+    from head_sharing import cache
+    calls=[]
+    monkeypatch.setattr(cache.os,'fsync',lambda fd:calls.append(fd))
+    log=tmp_path/'progress.jsonl'
+    cache._progress(log,'hashed_bytes',42,42)
+    assert json.loads(log.read_text())['done']==42
+    assert calls==[]
+    cache._progress(log,'cache_complete',1,1)
+    assert len(calls)==1
+    cache._atomic_json(tmp_path/'metadata.json',{'complete':True})
+    assert len(calls)==2
