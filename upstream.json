@@ -1,0 +1,22 @@
+{
+  "name": "Ultralytics YOLO26",
+  "repository": "https://github.com/ultralytics/ultralytics",
+  "version": "8.4.177",
+  "tag": "v8.4.177",
+  "commit": "ab3bd58844b0fa5fda4c14523ad6de8c87687479",
+  "license": "AGPL-3.0",
+  "wheel": "ultralytics-8.4.177-py3-none-any.whl",
+  "wheel_sha256": "de8fd2fc5ea2c51c7c8f5b50dd503d88702767395e2bc12474ec0741b846aecd",
+  "source_file_sha256": {
+    "models/yolo/detect/val.py": "c9f738b513ba3e59f19fbc7e97028e4e68b70b4846c6b96a1611e3f65b3322d7",
+    "nn/modules/conv.py": "927d511e0b494307e5e8104893f28addf27425999eab0ec83452bbf1f3b4df17",
+    "nn/modules/head.py": "b471bb8a39cc1e38672c20feaa8c28bdf43739adb8eafd14226807b34b31f3ee",
+    "nn/tasks.py": "1048ab8db7504e7c57a77d05bfbd855e9de0ef477e15a5aae8cdb7e8a958246a",
+    "utils/loss.py": "8eb4e089b7c36cef13bb872f9aa37e346da5c022bcfd979e11e7a57a0666b106",
+    "utils/torch_utils.py": "9bd9e9e9476959e93214ceccec4f8ead10f3b8aa8a7791efe22f5f1a9ef86f77"
+  },
+  "model_config": "ultralytics/cfg/models/26/yolo26.yaml",
+  "model_scale": "n",
+  "official_pretrained_weights_used": false,
+  "scope": "Frozen native backbone+neck and end-to-end Detect interface; only new head refiners are trained."
+}

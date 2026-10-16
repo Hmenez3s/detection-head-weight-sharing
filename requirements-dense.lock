@@ -1,0 +1,53 @@
+# Observed isolated Windows environment, Python 3.12.10; captured 2026-10-16.
+# Version lock, not a complete wheel-hash lock. GPU wheels use official CUDA 12.8.
+# The study package is installed separately from this repository with --no-deps.
+# No global driver, Python environment, or user application is part of this lock.
+--extra-index-url https://download.pytorch.org/whl/cu128
+anyio==4.15.1
+certifi==2026.7.22
+charset-normalizer==3.5.2
+colorama==0.4.6
+contourpy==1.4.0
+cycler==0.12.1
+execnet==2.1.2
+filelock==3.32.3
+fonttools==4.67.0
+fsspec==2026.7.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+iniconfig==2.3.1
+Jinja2==3.1.6
+kiwisolver==1.5.1
+MarkupSafe==3.0.3
+matplotlib==3.11.2
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.5.2
+nvidia-ml-py==13.615.71
+opencv-python==5.0.0.93
+packaging==26.3
+pillow==12.3.0
+pluggy==1.7.0
+polars==2.0.0
+polars-runtime-32==2.0.0
+psutil==7.2.2
+pycocotools==2.0.11
+Pygments==2.21.0
+pyparsing==3.3.3
+pytest==8.4.2
+pytest-xdist==3.8.0
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+requests==2.34.2
+setuptools==78.1.0
+six==1.17.0
+sympy==1.14.0
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
+typing_extensions==4.16.0
+ultralytics==8.4.177
+ultralytics-platform==0.1.89
+ultralytics-thop==2.2.2
+urllib3==2.8.0
