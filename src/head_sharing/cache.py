@@ -246,7 +246,9 @@ def build_cache(*, image_root: str | Path, annotations_path: str | Path, manifes
                             "targets_xywhn": _metadata_targets(indexed[image_id], cat_to_class, geo),
                             "flipped": {"original_shape": list(flipped_geo.original_shape), "ratio": list(flipped_geo.ratio), "pad": list(flipped_geo.pad), "targets_xywhn": _metadata_targets(indexed[image_id], cat_to_class, flipped_geo)}}
                 _progress(progress_path, "extracted_blocks", min(start+len(batch_ids), len(ordered)), len(ordered))
-        for array in arrays: array.flush()
+        for level, array in enumerate(arrays):
+            _progress(progress_path, "flushing_features", level, len(arrays))
+            array.flush()
         feature_files = [{"file": p.name, "shape": list(a.shape), "dtype": "float16", "sha256": _sha(p, progress_path=progress_path)} for p, a in zip(paths, arrays, strict=True)]
         _progress(progress_path, "hashed_complete", len(ordered), len(ordered))
     finally:

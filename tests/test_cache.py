@@ -160,3 +160,18 @@ def test_heartbeat_visibility_does_not_flush_each_image_but_completion_is_durabl
     assert len(calls)==1
     cache._atomic_json(tmp_path/'metadata.json',{'complete':True})
     assert len(calls)==2
+
+
+def test_each_blocking_feature_flush_has_visible_phase(monkeypatch, tmp_path):
+    events = []
+    original = np.memmap.flush
+    def flush(array):
+        events.append(('flush',))
+        return original(array)
+    monkeypatch.setattr(np.memmap, 'flush', flush)
+    monkeypatch.setattr(cache, '_progress', lambda path, phase, done, total: events.append(('progress', phase, done, total)))
+    build(tmp_path)
+    locations = [i for i, event in enumerate(events) if event == ('flush',)]
+    assert len(locations) == 3
+    for level, position in enumerate(locations):
+        assert events[position-1] == ('progress', 'flushing_features', level, 3)
