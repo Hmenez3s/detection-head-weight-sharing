@@ -24,10 +24,10 @@ def compact_manifest(source: dict, image_root: str | Path, probe_ids: list[int] 
     Random(20261016 XOR 0xC1EA).sample(sorted(few), 1000), before outcomes.
     """
     ids = source.get("ids")
-    if not isinstance(ids, dict) or not all(k in ids for k in ("few", "dev", "full")):
-        raise ValueError("manifest requires ids.few/dev/full")
-    few, dev, full = (list(ids[k]) for k in ("few", "dev", "full"))
-    for name, values in (("few", few), ("dev", dev), ("full", full)):
+    if not isinstance(ids, dict) or not all(k in ids for k in ("few", "dev")):
+        raise ValueError("manifest requires ids.few/dev")
+    few, dev = (list(ids[k]) for k in ("few", "dev"))
+    for name, values in (("few", few), ("dev", dev)):
         if len(values) != len(set(values)):
             raise ValueError(f"duplicate IDs in {name}")
     if set(few) & set(dev):

@@ -19,6 +19,7 @@ def test_compact_manifest_and_fixed_paired_blocks(tmp_path):
     assert "data_yaml" not in compact and "/private" not in json.dumps(compact)
     assert compact["probe_ids"] == [0,1]
     assert set(compact["ids"]) == set(compact["counts"]) == {"few", "dev"}
+    assert compact_manifest(compact, tmp_path, probe_ids=compact["probe_ids"]) == compact
     a, b = fixed_blocks(list(range(6)), 2), fixed_blocks(list(range(6)), 2)
     assert a == b and a["tail_policy"] == "keep_partial"
     assert list(epoch_batches(a, 7, 2)) == list(epoch_batches(b, 7, 2))
