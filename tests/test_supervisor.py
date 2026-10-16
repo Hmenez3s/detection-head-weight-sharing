@@ -149,3 +149,16 @@ def test_unknown_reservation_and_unowned_log_path_rejected(tmp_path):
     outside = tmp_path / "outside.log"
     with pytest.raises(Exception, match="logs/progress"):
         launch(ledger, token, ["x"], cwd=cwd, log_path=outside, progress_path=cwd/"p")
+
+
+def test_triton_cache_cannot_be_imported_as_optional_package(tmp_path):
+    ledger, token, cwd = setup(tmp_path)
+    script = ("import importlib.util,pathlib,os; root=pathlib.Path.cwd().resolve(); "
+              "assert pathlib.Path(os.environ['TRITON_CACHE_DIR']).name=='triton-cache'; "
+              "spec=importlib.util.find_spec('triton'); "
+              "assert spec is None or not any(pathlib.Path(p).resolve().is_relative_to(root) "
+              "for p in (spec.submodule_search_locations or [])); "
+              "pathlib.Path('progress').write_text('optional-import-safe')")
+    assert launch(ledger, token, [sys.executable, '-c', script], cwd=cwd,
+                  log_path=cwd/'job.log', progress_path=cwd/'progress', first_progress_seconds=2) == 0
+    assert (cwd/'progress').read_text() == 'optional-import-safe'

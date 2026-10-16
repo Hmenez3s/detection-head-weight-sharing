@@ -226,7 +226,9 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
         "CUDA_CACHE_PATH": job_root / "cuda-cache",
         "TORCH_EXTENSIONS_DIR": job_root / "torch-extensions",
         "TORCHINDUCTOR_CACHE_DIR": job_root / "torchinductor",
-        "TRITON_CACHE_DIR": job_root / "triton",
+        # An importable cwd/triton directory shadows the absent optional package
+        # as a namespace module and breaks torch.optim's Dynamo initialization.
+        "TRITON_CACHE_DIR": job_root / "triton-cache",
     }
     for path in set(cache_dirs.values()):
         if _has_symlink_component(path) or not path.absolute().is_relative_to(job_root):
