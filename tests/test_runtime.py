@@ -48,7 +48,9 @@ def test_live_lock_contention_waits_for_release(tmp_path):
     assert ledger.get_job(token)["status"] == "reserved"
 
 
-def test_lock_unknown_stale_and_double_reservation_fail_closed(tmp_path):
+def test_lock_unknown_stale_and_double_reservation_fail_closed(tmp_path, monkeypatch):
+    import head_sharing.runtime as runtime
+    monkeypatch.setattr(runtime, "LEDGER_LOCK_WAIT_SECONDS", 0.02)
     root = owned(tmp_path)
     ledger = AllocationLedger(root)
     (root / "ledger.lock").write_text('{"pid":999999}')

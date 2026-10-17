@@ -9,6 +9,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from .runtime import (AllocationLedger, CLEANUP_SAFETY_SECONDS,
@@ -193,6 +194,88 @@ def _terminate_owned(proc: subprocess.Popen, identity: str, *, grace: float = 2.
     except subprocess.TimeoutExpired: raise RuntimeErrorSafe("owned process did not reap")
 
 
+class _LaunchWatchdog:
+    """Ledger-free deadline/progress enforcement for one contained child tree."""
+    def __init__(self, proc: subprocess.Popen, identity: str, windows_job, *, deadline: float,
+                 started: float, progress: Path, first_progress_seconds: float,
+                 heartbeat_seconds: float):
+        self.proc, self.identity, self.windows_job = proc, identity, windows_job
+        self.deadline = deadline
+        self.started = started
+        self.progress = progress
+        self.first_progress_seconds = first_progress_seconds
+        self.heartbeat_seconds = heartbeat_seconds
+        self.reason: str | None = None
+        self.cleanup_error: BaseException | None = None
+        self._stop_attempted = False
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._finished = threading.Event()
+        self._thread = threading.Thread(target=self._watch, name="head-sharing-watchdog", daemon=False)
+        self._thread.start()
+
+    def _watch(self):
+        try:
+            while not self._stop_event.is_set() and self.proc.poll() is None:
+                now = time.time()
+                if now >= self.deadline:
+                    self._stop("reserved allocation deadline exceeded")
+                    return
+                try:
+                    stamp = self.progress.stat().st_mtime
+                except FileNotFoundError:
+                    stamp = None
+                if stamp is None or stamp <= self.started:
+                    if now - self.started > self.first_progress_seconds:
+                        self._stop("first real progress deadline exceeded")
+                        return
+                elif now - stamp > self.heartbeat_seconds:
+                    self._stop("progress heartbeat stalled")
+                    return
+                self._stop_event.wait(min(0.05, max(0.005, self.deadline-now)))
+        except BaseException as exc:
+            # A watchdog failure must not silently leave the owned child running.
+            try:
+                self._stop(f"watchdog enforcement failed ({type(exc).__name__})")
+            except BaseException:
+                pass
+        finally:
+            self._finished.set()
+
+    def _stop(self, reason: str | None):
+        with self._lock:
+            if reason is not None and self.reason is None:
+                self.reason = reason
+            if self._stop_attempted:
+                if self.cleanup_error is not None:
+                    raise self.cleanup_error
+                return
+            self._stop_attempted = True
+            try:
+                _terminate_owned(self.proc, self.identity, windows_job=self.windows_job)
+            except BaseException as exc:
+                self.cleanup_error = exc
+                raise
+            finally:
+                self._stop_event.set()
+
+    def stop_tree(self):
+        self._stop(None)
+
+    def raise_if_fired(self):
+        if self.reason is None:
+            return
+        if self.cleanup_error is not None:
+            raise RuntimeErrorSafe(
+                f"owned process tree cleanup unverified ({type(self.cleanup_error).__name__}: {self.cleanup_error}); allocation remains active"
+            )
+        raise TimeoutError(self.reason)
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join()
+
+
 def physical_memory_metrics(device_uuid: str) -> dict:
     """Query bounded nvidia-smi physical-memory data for one exact UUID."""
     try:
@@ -297,7 +380,10 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
     proc = None
     identity = None
     windows_job = None
+    watchdog = None
     tree_stopped = False
+    headroom_failure = None
+    deadline = _launch_deadline(started, job["seconds"], memory_guard=memory_guard)
     try:
         if os.name == "nt":
             windows_job = _WindowsJob()
@@ -306,10 +392,14 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
                     else f"exited-owned-popen:{proc.pid}:{started}")
         if windows_job is not None:
             windows_job.assign(proc.pid)
+        watchdog = _LaunchWatchdog(proc, identity, windows_job, deadline=deadline, started=started,
+                                   progress=progress, first_progress_seconds=first_progress_seconds,
+                                   heartbeat_seconds=heartbeat_seconds)
         ledger.update_job(token, pid=proc.pid, pid_identity=identity, started=started, status="running",
                           log=str(log), progress_file=str(progress), cwd=str(job_root))
+        watchdog.raise_if_fired()
         gate_path.touch(exist_ok=False)
-        deadline = _launch_deadline(started, job["seconds"], memory_guard=memory_guard)
+        watchdog.raise_if_fired()
         last_progress_stamp = None
         last_progress_commit = None
         last_memory_check = started
@@ -321,7 +411,7 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
                 try:
                     ledger.guard_headroom(token, memory_metrics(job["uuid"]), admission=False)
                 except BaseException as exc:
-                    ledger.update_job(token, headroom_failure=type(exc).__name__)
+                    headroom_failure = type(exc).__name__
                     raise
                 last_memory_check = now
             if progress.exists():
@@ -339,9 +429,12 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
             elif now - started > first_progress_seconds:
                 raise TimeoutError("first real progress deadline exceeded")
             time.sleep(min(0.25, max(0.01, deadline-now)))
+        watchdog.raise_if_fired()
         code = proc.returncode
-        _terminate_owned(proc, identity, windows_job=windows_job)
+        watchdog.stop_tree()
         tree_stopped = True
+        watchdog.stop()
+        watchdog.raise_if_fired()
         ended = time.time()
         if progress.exists() and progress.stat().st_mtime > started:
             last_progress_stamp = progress.stat().st_mtime
@@ -352,20 +445,38 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
     except BaseException as exc:
         if proc is not None and not tree_stopped:
             try:
-                _terminate_owned(proc, identity or _pid_identity(proc.pid), windows_job=windows_job)
-                tree_stopped = True
+                if watchdog is not None and watchdog.reason is not None:
+                    watchdog.stop()
+                    if watchdog.cleanup_error is not None:
+                        raise watchdog.cleanup_error
+                    tree_stopped = True
+                elif watchdog is not None:
+                    watchdog.stop_tree()
+                    watchdog.stop()
+                    tree_stopped = True
+                else:
+                    _terminate_owned(proc, identity or _pid_identity(proc.pid), windows_job=windows_job)
+                    tree_stopped = True
             except BaseException as cleanup_exc:
                 ended = time.time()
+                cleanup_updates = ({"headroom_failure": headroom_failure}
+                                   if headroom_failure is not None else {})
                 ledger.update_job(token, ended=ended, actual_wall_elapsed_seconds=ended-started,
-                                  status="active-unknown", failure="cleanup-unverified")
+                                  status="active-unknown", failure="cleanup-unverified", **cleanup_updates)
                 raise RuntimeErrorSafe(f"owned process tree cleanup unverified ({type(cleanup_exc).__name__}: {cleanup_exc}); allocation remains active") from exc
         if windows_job is not None and not tree_stopped:
             windows_job.close()
         ended = time.time()
+        failure_updates = {}
+        if headroom_failure is not None:
+            failure_updates["headroom_failure"] = headroom_failure
         ledger.update_job(token, ended=ended, actual_wall_elapsed_seconds=ended-started,
-                          exit_code=proc.poll() if proc else None, status="failed", failure=type(exc).__name__)
+                          exit_code=proc.poll() if proc else None, status="failed", failure=type(exc).__name__,
+                          **failure_updates)
         raise
     finally:
+        if watchdog is not None:
+            watchdog.stop()
         kwargs["stdout"].close()
 
 

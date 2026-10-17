@@ -2,12 +2,14 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
 from head_sharing.runtime import AllocationLedger, GPU_UUIDS, initialize
-from head_sharing.supervisor import _launch_deadline, child_entry, launch, windows_detached_flags
+from head_sharing.supervisor import (_LaunchWatchdog, _launch_deadline, _pid_identity,
+                                     _terminate_owned, child_entry, launch, windows_detached_flags)
 
 
 def setup(tmp_path):
@@ -227,6 +229,86 @@ def test_lexical_dotdot_cwd_cannot_escape_and_writes_nothing(tmp_path):
         launch(ledger, token, [sys.executable, "-c", "pass"], cwd=escape,
                log_path=escape/"log", progress_path=escape/"progress")
     assert list(outside.iterdir()) == []
+
+
+def test_watchdog_stop_joins_promptly_without_owning_parent_cleanup(tmp_path):
+    progress = tmp_path / "progress"
+    if os.name == "nt":
+        class LiveChild:
+            def poll(self):
+                return None
+        child, identity = LiveChild(), "fake-owned-child"
+    else:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                 start_new_session=True)
+        identity = _pid_identity(child.pid)
+    watchdog = _LaunchWatchdog(child, identity, None, deadline=time.time()+30,
+                               started=time.time(), progress=progress,
+                               first_progress_seconds=60, heartbeat_seconds=60)
+    try:
+        watchdog.stop()
+        assert not watchdog._thread.is_alive()
+        assert child.poll() is None  # stopping the monitor never substitutes for tree cleanup
+    finally:
+        if os.name != "nt":
+            _terminate_owned(child, identity)
+        watchdog.stop()
+    if os.name != "nt":
+        assert child.poll() is not None
+
+
+def test_watchdog_stops_child_when_ledger_registration_blocks_past_deadline(tmp_path, monkeypatch):
+    ledger, token, cwd = setup(tmp_path)
+    token = ledger.reserve(GPU_UUIDS[1], 9, phase="main", cpus=1)
+    entered = threading.Event()
+    release = threading.Event()
+    original_update = ledger.update_job
+    children = []
+
+    def blocked_update(job_token, **updates):
+        if updates.get("status") == "running":
+            entered.set()
+            assert release.wait(8)
+        return original_update(job_token, **updates)
+
+    def capture_child(*args, **kwargs):
+        proc = subprocess.Popen(*args, **kwargs)
+        children.append(proc)
+        return proc
+
+    monkeypatch.setattr(ledger, "update_job", blocked_update)
+    errors = []
+    started = time.time()
+    thread = threading.Thread(target=lambda: _capture_error(errors, lambda: launch(
+        ledger, token, [sys.executable, "-c",
+                        "import os,pathlib,time; g=pathlib.Path(os.environ['HEAD_SHARING_LAUNCH_GATE']); "
+                        "while_not_ready=True\nwhile while_not_ready and not g.exists(): time.sleep(.01)\n"
+                        "pathlib.Path('progress').touch(); time.sleep(30)"],
+        cwd=cwd, log_path=cwd/"watchdog.log", progress_path=cwd/"progress",
+        first_progress_seconds=30, popen_factory=capture_child)))
+    thread.start()
+    try:
+        assert entered.wait(3)
+        assert len(children) == 1
+        child = children[0]
+        assert child.wait(timeout=5) is not None
+        stopped_at = time.time()
+        assert stopped_at <= started + 5.5  # original 1s deadline plus bounded tree cleanup
+    finally:
+        release.set()
+        thread.join(timeout=8)
+    assert not thread.is_alive()
+    assert errors and isinstance(errors[0], TimeoutError)
+    job = ledger.get_job(token)
+    assert job["status"] == "failed" and job["seconds"] == 9
+    assert job["status"] != "complete"
+
+
+def _capture_error(errors, call):
+    try:
+        call()
+    except BaseException as exc:
+        errors.append(exc)
 
 
 def test_timeout_stops_early_and_counts_cleanup_within_reserved_limit(tmp_path):
