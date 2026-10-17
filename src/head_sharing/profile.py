@@ -195,7 +195,9 @@ def main(argv=None):
         job_root,progress_path=Path(job["cwd"]),Path(job["progress_file"])
         if job["uuid"]!=args.uuid or _has_symlink_component(job_root) or not job_root.resolve(strict=True).is_relative_to(root.resolve(strict=True)):
             raise RuntimeError("reservation identity or job confinement failure")
-        if _has_symlink_component(progress_path) or progress_path.parent.resolve(strict=True)!=job_root.resolve(strict=True) or not progress_path.is_file():
+        if (_has_symlink_component(progress_path) or progress_path.absolute() != progress_path or
+                progress_path.parent.resolve(strict=True) != job_root.resolve(strict=True) or
+                (progress_path.exists() and not progress_path.is_file())):
             raise RuntimeError("supervisor progress path is not job-owned")
         if os.environ.get("CUDA_VISIBLE_DEVICES")!=args.uuid: raise RuntimeError("assigned UUID visibility mismatch")
         for key in ("YOLO_CONFIG_DIR","TORCH_HOME","MPLCONFIGDIR","TMPDIR","CUDA_CACHE_PATH","TORCH_EXTENSIONS_DIR","TORCHINDUCTOR_CACHE_DIR","TRITON_CACHE_DIR"):

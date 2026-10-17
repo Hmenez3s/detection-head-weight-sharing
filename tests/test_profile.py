@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -213,6 +214,85 @@ def test_persisted_synthetic_cpu_profile_cli_binds_loaded_checkpoint(tmp_path):
     assert result["inference_peak"] is None and result["checkpoint_files_unchanged"] is True
     assert result["checkpoint_file_sha256"] == {"head_weights":hashes[weights],"head_config":hashes[config],"trunk_artifact":hashes[trunk]}
     assert {p:hashlib.sha256(p.read_bytes()).hexdigest() for p in hashes} == hashes
+
+
+def _cuda_guard_fixture(tmp_path, monkeypatch, progress_path=None):
+    from head_sharing.runtime import GPU_UUIDS, AllocationLedger, initialize
+
+    root = tmp_path / "study"
+    root.mkdir()
+    (root / "STUDY_OWNER.txt").write_text("test fixture\n")
+    ledger_path = initialize(root, "allocation-ledger")
+    ledger = AllocationLedger(ledger_path)
+    token = ledger.reserve(GPU_UUIDS[0], 120, phase="final")
+    job_root = root / "job"
+    job_root.mkdir()
+    progress = progress_path or job_root / "progress.jsonl"
+    ledger.update_job(token, status="running", cwd=str(job_root), progress_file=str(progress))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", GPU_UUIDS[0])
+    for key in ("YOLO_CONFIG_DIR", "TORCH_HOME", "MPLCONFIGDIR", "TMPDIR", "CUDA_CACHE_PATH",
+                "TORCH_EXTENSIONS_DIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        path = job_root / key.lower()
+        path.mkdir()
+        if key == "YOLO_CONFIG_DIR":
+            (path / "Ultralytics").mkdir()
+        monkeypatch.setenv(key, str(path))
+    import head_sharing.supervisor as supervisor
+    monkeypatch.setattr(supervisor, "child_entry", lambda *args, **kwargs: None)
+    args = ["--device", "cuda", "--measurement", "inference", "--weights", str(root / "weights.pt"),
+            "--config", str(root / "config.json"), "--trunk-artifact", str(root / "trunk.pt"),
+            "--protocol", str(root / "protocol.json"), "--uuid", GPU_UUIDS[0], "--owned-root", str(root),
+            "--ledger", str(ledger_path), "--reservation", token, "--output", str(job_root / "output.json")]
+    return args, progress
+
+
+def test_cuda_profile_guard_accepts_missing_owned_progress_before_native_imports(tmp_path, monkeypatch):
+    import head_sharing.protocol as protocol
+    from head_sharing.profile import main
+
+    args, progress = _cuda_guard_fixture(tmp_path, monkeypatch)
+
+    class ReachedProtocolVerification(Exception):
+        pass
+
+    def stop_at_protocol(*args, **kwargs):
+        raise ReachedProtocolVerification
+
+    monkeypatch.setattr(protocol, "verify_frozen", stop_at_protocol)
+    try:
+        main(args)
+    except ReachedProtocolVerification:
+        pass
+    else:
+        raise AssertionError("profile did not reach protocol verification after confinement")
+    assert not progress.exists()
+
+
+@pytest.mark.parametrize("invalid", ["symlink", "directory", "outside"])
+def test_cuda_profile_guard_rejects_nonowned_progress_before_protocol(tmp_path, monkeypatch, invalid):
+    import head_sharing.protocol as protocol
+    from head_sharing.profile import main
+
+    args, progress = _cuda_guard_fixture(tmp_path, monkeypatch)
+    from head_sharing.runtime import AllocationLedger
+    token = args[args.index("--reservation") + 1]
+    ledger = AllocationLedger(args[args.index("--ledger") + 1])
+    if invalid == "outside":
+        progress = tmp_path / "outside-progress.jsonl"
+        ledger.update_job(token, progress_file=str(progress))
+    elif invalid == "directory":
+        progress.mkdir()
+    else:
+        progress.symlink_to(tmp_path / "outside-target")
+    protocol_calls = []
+    monkeypatch.setattr(protocol, "verify_frozen", lambda *a, **k: protocol_calls.append(True))
+    try:
+        main(args)
+    except RuntimeError as exc:
+        assert "progress path" in str(exc)
+    else:
+        raise AssertionError(f"{invalid} supervisor progress path was accepted")
+    assert protocol_calls == []
 
 
 def test_common_q_head_and_full_cpu_smoke_is_labeled_non_study():
