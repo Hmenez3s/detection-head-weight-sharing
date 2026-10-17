@@ -56,8 +56,12 @@ def test_looped_matrix_requires_fixed_architecture_and_native_reference():
         'study_id':'looped_v1','looped_architecture':copy.deepcopy(LOOPED_ARCHITECTURE),
         'reference_native':{'protocol':{'path':'../escape.json','sha256':'c'*64,'recipe_sha256':'d'*64},
                             'freeze':{'path':'source/freeze.json','sha256':'e'*64}}}
-    with pytest.raises(ValueError,match='normalized'):
-        validate_recipe(value,synthetic=True)
+    from head_sharing.evaluate import _portable_relative
+    for unsafe in ('../escape.json', 'C:/escape.json', 'C:escape.json', 'source/file.json:stream'):
+        value['environment']['reference_native']['protocol']['path'] = unsafe
+        assert not _portable_relative(unsafe)
+        with pytest.raises(ValueError,match='normalized'):
+            validate_recipe(value,synthetic=True)
 
 
 def test_production_looped_recipe_pins_hashes_not_basenames_and_exact_dose():

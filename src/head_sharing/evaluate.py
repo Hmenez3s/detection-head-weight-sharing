@@ -66,7 +66,7 @@ def _relative(path: Path, root: Path) -> str:
 
 def _portable_relative(value: object) -> bool:
     from pathlib import PurePosixPath
-    return (isinstance(value,str) and bool(value) and "\\" not in value and
+    return (isinstance(value,str) and bool(value) and "\\" not in value and ":" not in value and
             str(PurePosixPath(value)) == value and not PurePosixPath(value).is_absolute() and
             all(part not in ("", ".", "..") for part in value.split("/")))
 

@@ -65,7 +65,7 @@ def validate_recipe(recipe, *, synthetic=False):
                 raise ValueError("native source bindings have an invalid schema")
             path = item["path"]
             from pathlib import PurePosixPath
-            if (not isinstance(path, str) or "\\" in path or
+            if (not isinstance(path, str) or "\\" in path or ":" in path or
                     str(PurePosixPath(path)) != path or PurePosixPath(path).is_absolute() or
                     any(part in ("", ".", "..") for part in path.split("/"))):
                 raise ValueError("native source path must be normalized and relative")
