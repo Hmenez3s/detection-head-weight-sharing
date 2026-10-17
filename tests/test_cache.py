@@ -175,3 +175,28 @@ def test_each_blocking_feature_flush_has_visible_phase(monkeypatch, tmp_path):
     assert len(locations) == 3
     for level, position in enumerate(locations):
         assert events[position-1] == ('progress', 'flushing_features', level, 3)
+
+
+def test_dev_comparison_uses_declared_dev_ids_not_disjoint_train_probe(tmp_path, monkeypatch, capsys):
+    import head_sharing.checkpoint as checkpoint
+    image_root, ap, mp, rp, model, artifact = fixture(tmp_path)
+    model.imgsz = 512
+    out = tmp_path/'dev512'
+    metadata = cache.build_cache(image_root=image_root, annotations_path=ap, manifest_path=mp,
+        receipt_path=rp, trunk_artifact=artifact, output=out, model=model, producer='cpu',
+        cohort='dev', batch_size=3, synthetic=True)
+    load = checkpoint.load_trunk_artifact
+    monkeypatch.setattr(checkpoint, 'load_trunk_artifact',
+        lambda target, path, receipt: load(target, artifact, receipt=receipt, synthetic=True))
+    declared = metadata['block_order']['dev'][0]
+    assert declared not in metadata['cohort_ids']['probe']
+    args = ['compare', '--cache', str(out), '--expected-producer', 'cpu', '--image-root', str(image_root),
+        '--receipt', str(rp), '--trunk-artifact', str(tmp_path/'synthetic-trunk'), '--imgsz', '512',
+        '--device', 'cpu', '--atol', '0', '--rtol', '0', '--probe-id', str(declared)]
+    assert cache.main(args) == 0
+    rows = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{')]
+    assert len(rows) == 1 and rows[0]['cohort'] == 'dev' and rows[0]['mode'] == 'matched_build_group'
+    assert rows[0]['feature_max_abs'] == 0 and rows[0]['decoded_max_abs'] == 0
+    args[-1] = str(metadata['cohort_ids']['probe'][0])
+    with pytest.raises(ValueError, match='not declared for this cohort'):
+        cache.main(args)

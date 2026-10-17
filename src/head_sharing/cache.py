@@ -373,7 +373,10 @@ def main(argv: list[str] | None = None) -> int:
     with load_cache(args.cache, expected_producer=producer, progress_path=progress_path) as reader:
         m = reader.metadata
         if args.imgsz != m["imgsz"]: raise ValueError("comparison resolution differs from cache")
-        if args.probe_id not in m["cohort_ids"]["probe"]: raise ValueError("comparison ID is not a declared probe")
+        # Dev is disjoint from the clean train probe, but needs the same
+        # producer/batch-specific equivalence gate. Never admit undeclared IDs.
+        declared = m["cohort_ids"]["dev" if m["cohort"] == "dev" else "probe"]
+        if args.probe_id not in declared: raise ValueError("comparison ID is not declared for this cohort")
         ordered = m["block_order"][m["cohort"]]; probe_pos = ordered.index(args.probe_id)
         start = (probe_pos // m["batch_size"]) * m["batch_size"]; stop = min(start+m["batch_size"],len(ordered)); group_ids=ordered[start:stop]
         rows = {x["image_id"]:x for x in m["images"]}; image_root = Path(args.image_root).resolve(strict=True)
