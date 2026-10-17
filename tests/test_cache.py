@@ -77,6 +77,90 @@ def test_cohorts_contiguous_views_tail_q_oracle_and_one_open_two_epochs(tmp_path
         with pytest.raises(ValueError,match="cohort"): list(cache.read_blocks(reader,"few",dev["block_order"]["dev"]))
 
 
+def test_streamed_spans_match_inspection_maps_and_survive_close(tmp_path):
+    _, out, metadata, _ = build(tmp_path)
+    with cache.load_cache(out) as reader:
+        ids = metadata["block_order"]["few"]
+        before = json.loads(json.dumps(reader.metadata))
+        expected = []
+        for flipped in (False, True):
+            for start in range(0, len(ids), 3):
+                stop = min(start + 3, len(ids))
+                expected.append(([torch.from_numpy(np.array(a[int(flipped), start:stop], copy=True)).float()
+                                  for a in reader.maps], ids[start:stop]))
+        original_maps = reader.maps
+
+        class NoPayloadReads:
+            def __init__(self, array): self.array = array
+            @property
+            def shape(self): return self.array.shape
+            def __getitem__(self, key): raise AssertionError("batch read touched inspection memmap")
+
+        reader.maps = [NoPayloadReads(array) for array in original_maps]
+        actual = []
+        for flipped in (False, True):
+            actual.extend((features, [row["image_id"] for row in rows]) for features, rows in
+                          cache.read_blocks(reader, "few", ids, flipped=flipped, batch_size=3))
+        assert len(actual) == len(expected)
+        for (features, rows), (reference, reference_rows) in zip(actual, expected, strict=True):
+            assert rows == reference_rows
+            assert all(torch.equal(x, y) for x, y in zip(features, reference, strict=True))
+        assert reader.metadata == before
+        # Direct scattered inspection remains supported and unchanged.
+        reader.maps = original_maps
+        scattered = original_maps[0][1, [0, 2]].copy()
+        assert np.array_equal(reader.maps[0][1, [0, 2]], scattered)
+        held = actual[0][0][0].clone()
+        reader.close(); reader.close()
+        assert torch.equal(actual[0][0][0], held)
+        assert reader.read_bytes == sum(x.numel() * 2 for pair, _ in actual for x in pair)
+
+
+@pytest.mark.parametrize("arm", ["loop_ab2", "loop_a3"])
+def test_native_criterion_optimizer_equivalence_for_streamed_features(tmp_path, arm):
+    from head_sharing.train import _native_criterion, optimizer_groups
+    _, out, metadata, _ = build(tmp_path)
+    with cache.load_cache(out) as reader:
+        ids = metadata["block_order"]["few"][:1]
+        old_features = [torch.from_numpy(np.array(a[0, :1], copy=True)).float() for a in reader.maps]
+        new_features, rows = next(cache.read_blocks(reader, "few", ids, batch_size=1))
+        assert [row["image_id"] for row in rows] == ids
+    targets = rows[0]["targets_xywhn"]
+    batch_targets = torch.tensor([[0, *target] for target in targets], dtype=torch.float32).reshape(-1, 6)
+    batch = {"batch_idx": batch_targets[:, 0], "cls": batch_targets[:, 1:2], "bboxes": batch_targets[:, 2:]}
+    models = [HeadStudyModel(seed=321, imgsz=32, arm=arm) for _ in range(2)]
+    assert all(torch.equal(a, b) for a, b in zip(models[0].state_dict().values(), models[1].state_dict().values(), strict=True))
+    optimizers = [torch.optim.SGD(optimizer_groups(model, .0005), lr=.01, momentum=.9) for model in models]
+    criteria = [_native_criterion(model, 2) for model in models]
+    losses = []
+    for model, optimizer, criterion, features in zip(models, optimizers, criteria, (old_features, new_features), strict=True):
+        predictions = model.forward_features(features)
+        loss, _ = criterion(predictions, batch)
+        losses.append(loss.detach().clone())
+        optimizer.zero_grad(set_to_none=True)
+        loss.sum().backward()
+        grads = [p.grad.detach().clone() for p in model.parameters() if p.requires_grad and p.grad is not None]
+        optimizer.step()
+        model._test_grads = grads
+    assert torch.equal(*losses)
+    assert all(torch.equal(a, b) for a, b in zip(models[0]._test_grads, models[1]._test_grads, strict=True))
+    assert all(torch.equal(a, b) for a, b in zip(models[0].state_dict().values(), models[1].state_dict().values(), strict=True))
+    assert all(torch.equal(a, b) for a, b in zip(models[0].detector.model[:-1].state_dict().values(),
+                                                models[1].detector.model[:-1].state_dict().values(), strict=True))
+
+
+def test_short_read_is_rejected_without_exposing_uninitialized_data(tmp_path):
+    reader = cache.CacheReader.__new__(cache.CacheReader)
+    reader.metadata = {"feature_files": [{"shape": [1, 1, 1, 1, 2]}]}
+    reader._read_lock = __import__("threading").Lock()
+    path = tmp_path / "short.f16"
+    path.write_bytes(b"\x00\x00")
+    reader._streams = [path.open("rb")]
+    with pytest.raises(EOFError, match="short read"):
+        reader.read_span(0, 0, 0, 1)
+    reader.close()
+
+
 def test_hash_before_annotation_parse_strict_trunk_and_metadata_corruption(tmp_path,monkeypatch):
     image_root,ap,mp,rp,model,artifact=fixture(tmp_path)
     out=tmp_path/"wrong-hash"
@@ -200,3 +284,14 @@ def test_dev_comparison_uses_declared_dev_ids_not_disjoint_train_probe(tmp_path,
     args[-1] = str(metadata['cohort_ids']['probe'][0])
     with pytest.raises(ValueError, match='not declared for this cohort'):
         cache.main(args)
+
+
+def test_stream_span_bounds_and_closed_reader(tmp_path):
+    _, out, metadata, _ = build(tmp_path)
+    with cache.load_cache(out) as reader:
+        count = reader.metadata['count']
+        for level,view,start,stop in ((-1,0,0,1),(3,0,0,1),(0,2,0,1),(0,0,-1,1),(0,0,0,count+1),(0,0,1,1)):
+            with pytest.raises(ValueError,match='invalid cache'):
+                reader.read_span(level,view,start,stop)
+    with pytest.raises(ValueError,match='closed'):
+        reader.read_span(0,0,0,1)

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 
 import numpy as np
@@ -55,7 +56,7 @@ def _read_json(path: Path) -> dict:
 
 
 class CacheReader:
-    """Validated immutable cache handle; hashes once at open, then reuses read-only maps."""
+    """Validated cache with cold inspection maps and bounded batch streams."""
     def __init__(self, root: str | Path, *, expected_producer: str | None = None,
                  expected_identity: dict | None = None, progress_path: str | Path | None = None):
         self.root = Path(root)
@@ -75,6 +76,8 @@ class CacheReader:
         if m.get("cohort") not in ("few", "dev", "probe") or not isinstance(m.get("imgsz"), int) or m["imgsz"] <= 0 or m["imgsz"] % 32: raise ValueError("cache geometry/cohort layout mismatch")
         if m.get("fixed_layout", {}).get("ids") != m.get("block_order", {}).get(m.get("cohort")): raise ValueError("fixed block layout mismatch")
         self.maps = []
+        self._streams = []
+        self._read_lock = threading.Lock()
         known = {f"features-{i}.f16" for i in range(3)}
         try:
             if len(m.get("feature_files", [])) != 3 or len(m.get("images", [])) != m.get("count"): raise ValueError("cache layout is incomplete")
@@ -90,6 +93,7 @@ class CacheReader:
                 nbytes = int(np.prod(item["shape"])) * 2
                 if path.stat().st_size != nbytes: raise ValueError("cache feature shard size mismatch")
                 self.maps.append(np.memmap(path, mode="r", dtype="float16", shape=tuple(item["shape"])))
+                self._streams.append(path.open("rb"))
             if sorted(known) != sorted(item["file"] for item in m["feature_files"]): raise ValueError("cache shards incomplete")
         except BaseException:
             self.close()
@@ -97,11 +101,32 @@ class CacheReader:
         self.read_bytes = 0
         self.read_seconds = 0.0
 
+    def read_span(self, level: int, view: int, start: int, stop: int) -> np.ndarray:
+        """Read one validated contiguous FP16 span into a caller-owned buffer."""
+        if not 0 <= level < len(self.metadata["feature_files"]): raise ValueError("invalid cache level")
+        item = self.metadata["feature_files"][level]
+        views, count, channels, height, width = item["shape"]
+        if not (0 <= view < views and 0 <= start < stop <= count): raise ValueError("invalid cache span")
+        frame_bytes = channels * height * width * 2
+        with self._read_lock:
+            if len(self._streams) <= level or self._streams[level].closed: raise ValueError("cache reader is closed")
+            result = np.empty((stop - start, channels, height, width), dtype=np.float16, order="C")
+            stream = self._streams[level]
+            stream.seek(((view * count + start) * frame_bytes))
+            view_bytes = memoryview(result).cast("B")
+            read = stream.readinto(view_bytes)
+            if read != len(view_bytes): raise EOFError("short read from cache feature shard")
+        return result
+
     def close(self):
-        for array in getattr(self, "maps", []):
-            mmap = getattr(array, "_mmap", None)
-            if mmap is not None: mmap.close()
-        self.maps = []
+        with self._read_lock:
+            for stream in self._streams:
+                if not stream.closed: stream.close()
+            self._streams = []
+            for array in getattr(self, "maps", []):
+                mmap = getattr(array, "_mmap", None)
+                if mmap is not None and not mmap.closed: mmap.close()
+            self.maps = []
 
     def __enter__(self): return self
     def __exit__(self, *_): self.close()
@@ -135,7 +160,9 @@ def read_blocks(reader: CacheReader, cohort: str, ids: list[int], *, flipped: bo
         if positions != list(range(positions[0], positions[0] + len(positions))): raise ValueError("requested IDs must follow physical block order")
         view = int(flipped)
         started = time.monotonic()
-        tensors = [torch.from_numpy(np.array(a[view, positions[0]:positions[-1]+1], copy=True)).float() for a in reader.maps]
+        # Keep maps cold for explicit inspection; training batches stream into bounded owned buffers.
+        tensors = [torch.from_numpy(reader.read_span(level, view, positions[0], positions[-1]+1)).float()
+                   for level in range(len(reader.metadata["feature_files"]))]
         reader.read_seconds += time.monotonic() - started
         reader.read_bytes += sum(t.numel() * 2 for t in tensors)
         yield tensors, [m["images"][p] for p in positions]
