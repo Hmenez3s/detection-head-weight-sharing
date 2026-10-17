@@ -202,7 +202,7 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
     from .cache import load_cache, _read_json, _sha, _atomic_json, _progress
     from .data import fixed_blocks
     from .model import HeadStudyModel
-    from .checkpoint import load_trunk_artifact, save_checkpoint, load_resume, resume_training_state
+    from .checkpoint import load_trunk_artifact, save_checkpoint, load_checkpoint, load_resume, resume_training_state, _rng_state, _restore_rng
     if purpose not in ('pilot', 'main'): raise ValueError('unknown experiment purpose')
     if purpose == 'pilot' and seed != 997: raise ValueError('technical pilot requires seed 997')
     if purpose == 'main' and (seed not in recipe['seed_list'] or arm not in recipe['arms']):
@@ -264,6 +264,15 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
                     'trunk_sha256': recipe['trunk_sha256'], 'trunk_digest': frozen_digest,
                     'manifest_file_sha256': manifest_file_sha, 'cache_hashes': {n: readers[n].metadata['metadata_sha256'] for n in names},
                     'target_epochs': target, 'synthetic': synthetic, 'recipe': recipe}
+        numeric = {'trunk': 'FP32', 'Q': HeadStudyModel.quantization, 'training_head': 'BF16' if device != 'cpu' else 'FP32',
+                   'metric_head': 'FP32', 'effective_tf32': False, 'CUBLAS_WORKSPACE_CONFIG': ':4096:8', 'ema': False,
+                   'cuda_matmul_allow_tf32': torch.backends.cuda.matmul.allow_tf32,
+                   'cudnn_allow_tf32': torch.backends.cudnn.allow_tf32,
+                   'cudnn_benchmark': torch.backends.cudnn.benchmark,
+                   'cudnn_deterministic': torch.backends.cudnn.deterministic,
+                   'deterministic_algorithms': torch.are_deterministic_algorithms_enabled()}
+        hardware = {'device_uuid': 'cpu' if device == 'cpu' else recipe['gpu_for_seed'][str(seed)], 'torch_version': str(torch.__version__),
+                    'cpu_threads': torch.get_num_threads()}
         optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01, momentum=.9)
         start = 0; history = []; selected_epoch = None; best = None; criterion = None
         if continuing:
@@ -290,7 +299,56 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
                                    total_steps=target*len(readers['few'].metadata['fixed_layout']['blocks']))
             if load_resume(model, optimizer, resume_path, expected_state=expected_resume) != start:
                 raise ValueError('resume curve does not cover completed epochs')
-            if start == target: raise ValueError('completed checkpoints are immutable')
+            if start == target:
+                # The authoritative checkpoint may have committed the final epoch
+                # before its presentation record. Only finish that publication; do
+                # not optimize, evaluate, or alter the checkpoint's selection.
+                if not previous_record.is_file():
+                    raise ValueError('completed checkpoint lacks presentation baseline')
+                record = _read_json(previous_record)
+                if not isinstance(record, dict) or any(record.get(key) != value for key, value in {
+                        'schema_version': 1, 'purpose': purpose, 'arm': arm, 'seed': seed,
+                        'protocol_sha256': protocol_sha256, 'target_epochs': target}.items()):
+                    raise ValueError('completed checkpoint presentation baseline binding mismatch')
+                initial_digest = record.get('initial_head_parameter_sha256')
+                if not isinstance(initial_digest, str) or len(initial_digest) != 64 or any(c not in '0123456789abcdef' for c in initial_digest):
+                    raise ValueError('completed checkpoint presentation baseline lacks initial head digest')
+                last_digest = _head_parameter_digest(model)
+                rng_before_last_validation = _rng_state()
+                try:
+                    last_model = load_checkpoint(resume_path.parent/'last.pt', resume_path.parent/'last.json',
+                                                 trunk_artifact=trunk_artifact, synthetic_trunk=synthetic)
+                finally:
+                    # Construction calls manual_seed on all devices; restore the
+                    # same complete RNG payload used by epoch-boundary resumes.
+                    _restore_rng(rng_before_last_validation)
+                last_state = last_model.detect.state_dict()
+                resume_state = model.detect.state_dict()
+                if set(last_state) != set(resume_state) or any(
+                        not torch.equal(last_state[name].detach().cpu(), resume_state[name].detach().cpu()) for name in last_state):
+                    raise ValueError('last deployment checkpoint disagrees with authoritative resume state')
+                if _head_parameter_digest(last_model) != last_digest:
+                    raise ValueError('last deployment digest disagrees with authoritative resume state')
+                final_assets = ['resume.pt', 'last.pt', 'last.json'] + list(state['selected_hashes'])
+                final_asset_hashes = {name: _sha(resume_path.parent/name) for name in final_assets}
+                if resume_from is not None:
+                    import shutil
+                    output.mkdir(parents=True, exist_ok=False)
+                    for name in final_assets:
+                        shutil.copyfile(resume_path.parent/name, output/name)
+                    if any(_sha(output/name) != sha for name, sha in final_asset_hashes.items()):
+                        raise ValueError('copied final checkpoint assets failed hash verification')
+                record.update({'schema_version': 1, 'purpose': purpose, 'synthetic': synthetic, 'arm': arm, 'seed': seed,
+                               'protocol_sha256': protocol_sha256, 'target_epochs': target, 'epochs_completed': target,
+                               'selected_epoch': selected_epoch, 'selection_metric': 'dev.AP50:95',
+                               'selected_dev_ap': best,
+                               'selected_config': f'selected-e{selected_epoch}.json' if selected_epoch is not None else None,
+                               'last_config': 'last.json', 'history': history, 'hardware': hardware,
+                               'numeric_policy': numeric, 'frozen_trunk_digest': frozen_digest,
+                               'stage_timings': timings, 'last_head_parameter_sha256': last_digest})
+                record['head_updated'] = record.get('last_head_parameter_sha256') != record.get('initial_head_parameter_sha256')
+                _atomic_json(output/'training.json', record)
+                return record
             if resume_from is not None:
                 import shutil
                 if selected_epoch is not None:
@@ -306,15 +364,6 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
         batches = cache_batches(readers['few'], seed=seed, ids=cohorts['few'], batch_size=batch)
         end = target if stop_epoch is None else stop_epoch
         if not start < end <= target: raise ValueError('invalid interruption boundary')
-        numeric = {'trunk': 'FP32', 'Q': HeadStudyModel.quantization, 'training_head': 'BF16' if device != 'cpu' else 'FP32',
-                   'metric_head': 'FP32', 'effective_tf32': False, 'CUBLAS_WORKSPACE_CONFIG': ':4096:8', 'ema': False,
-                   'cuda_matmul_allow_tf32': torch.backends.cuda.matmul.allow_tf32,
-                   'cudnn_allow_tf32': torch.backends.cudnn.allow_tf32,
-                   'cudnn_benchmark': torch.backends.cudnn.benchmark,
-                   'cudnn_deterministic': torch.backends.cudnn.deterministic,
-                   'deterministic_algorithms': torch.are_deterministic_algorithms_enabled()}
-        hardware = {'device_uuid': 'cpu' if device == 'cpu' else recipe['gpu_for_seed'][str(seed)], 'torch_version': str(torch.__version__),
-                    'cpu_threads': torch.get_num_threads()}
         for epoch in range(start, end):
             started = time.monotonic()
             result = train(model, batches, epochs=target, seed=seed, start_epoch=epoch, stop_epoch=epoch+1,

@@ -68,6 +68,130 @@ for device in ('cpu', 'GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99'):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_completed_checkpoint_repairs_failed_final_presentation(tmp_path, monkeypatch):
+    import hashlib
+    import pytest
+    import torch
+    import head_sharing.cache as cache
+    from head_sharing import train as train_module
+    from head_sharing.model import HeadStudyModel
+    from head_sharing.checkpoint import load_checkpoint, load_resume, load_trunk_artifact, _rng_state
+    from head_sharing.protocol import SELECTION, NUMERIC_POLICY
+    from head_sharing.runtime import GPU_UUIDS
+    from test_cache import RECEIPT, fixture
+
+    torch.set_num_threads(1)
+    images, annotations, manifest_path, receipt_path, trunk_model, artifact = fixture(tmp_path / "fixture")
+    source_annotations = json.loads(annotations.read_text())
+    for row in source_annotations["annotations"]:
+        row["area"] = row["bbox"][2] * row["bbox"][3]
+    annotations.write_text(json.dumps(source_annotations))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source_annotation_sha256"] = hashlib.sha256(annotations.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    cache_paths = {}
+    evidence = {}
+    for cohort in ("few", "dev", "probe"):
+        path = tmp_path / f"cache-{cohort}"
+        cache.build_cache(image_root=images, annotations_path=annotations, manifest_path=manifest_path,
+                          receipt_path=receipt_path, trunk_artifact=artifact, output=path,
+                          model=trunk_model, producer="cpu", cohort=cohort, batch_size=2,
+                          synthetic=True)
+        cache_paths[cohort] = path
+        evidence[cohort] = {"metadata_file_sha256": cache._sha(path / "metadata.json")}
+    recipe = {"seed_list": [11], "arms": ["native"], "imgsz": 32, "epochs": 2, "cadence": 1,
+              "batch_size": 2, "producer": "cpu", "synthetic": True,
+              "quantization": "fp32_fp16_fp32_v1", "split_sha256": cache._sha(manifest_path),
+              "trunk_sha256": RECEIPT["trunk_artifact_sha256"], "cache_evidence": evidence,
+              "gpu_for_seed": {"11": GPU_UUIDS[0]}, "selection": SELECTION,
+              "numeric_policy": NUMERIC_POLICY}
+    common = dict(purpose="main", arm="native", seed=11, recipe=recipe, protocol_sha256="synthetic-protocol",
+                  cache_paths=cache_paths, manifest_path=manifest_path, annotations_path=annotations,
+                  trunk_artifact=artifact, receipt=RECEIPT, device="cpu", synthetic=True)
+    from pathlib import Path
+    atomic_json = cache._atomic_json
+    original_train = train_module.train
+
+    def fail_final_record(path, value):
+        if Path(path).name == "training.json" and value["epochs_completed"] == 2:
+            raise OSError("injected final presentation failure")
+        return atomic_json(path, value)
+
+    monkeypatch.setattr(cache, "_atomic_json", fail_final_record)
+    for recovery_mode in ("inplace", "fresh"):
+        output = tmp_path / f"interrupted-{recovery_mode}"
+        with pytest.raises(OSError, match="injected final presentation failure"):
+            train_module.experiment(**common, output=output)
+        checkpoint = torch.load(output / "resume.pt", map_location="cpu", weights_only=True)
+        stale = json.loads((output / "training.json").read_text())
+        assert checkpoint["epoch"] == 2 and len(checkpoint["training_state"]["history"]) == 2
+        assert stale["epochs_completed"] == 1 and len(stale["history"]) == 1
+        checkpoint_sha = cache._sha(output / "resume.pt")
+        selected_hashes = checkpoint["training_state"]["selected_hashes"]
+        final_assets = ["resume.pt", "last.pt", "last.json", *selected_hashes]
+        asset_hashes = {name: cache._sha(output / name) for name in final_assets}
+        monkeypatch.setattr(cache, "_atomic_json", atomic_json)
+        destination = output if recovery_mode == "inplace" else tmp_path / "fresh-recovery"
+        no_training = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("completed resume trained again"))
+        monkeypatch.setattr(train_module, "train", no_training)
+        if recovery_mode == "inplace":
+            recovered = train_module.experiment(**common, output=destination, resume=True)
+        else:
+            recovered = train_module.experiment(**common, output=destination, resume_from=output / "resume.pt")
+        monkeypatch.setattr(train_module, "train", original_train)
+        record = json.loads((destination / "training.json").read_text())
+        assert recovered == record
+        actual_rng = _rng_state()
+        assert torch.equal(actual_rng["torch_cpu"], checkpoint["rng"]["torch_cpu"])
+        assert actual_rng["python"] == checkpoint["rng"]["python"]
+        assert actual_rng["numpy"][0] == checkpoint["rng"]["numpy"][0]
+        assert torch.equal(actual_rng["numpy"][1], checkpoint["rng"]["numpy"][1])
+        assert actual_rng["numpy"][2:] == checkpoint["rng"]["numpy"][2:]
+        assert record["epochs_completed"] == record["target_epochs"] == 2
+        assert record["history"] == checkpoint["training_state"]["history"]
+        assert record["selected_epoch"] == checkpoint["training_state"]["selected_epoch"]
+        assert record["selected_dev_ap"] == checkpoint["training_state"]["selected_dev_ap"]
+        assert record["frozen_trunk_digest"] == stale["frozen_trunk_digest"]
+        restored_model = HeadStudyModel("native", 11, 32)
+        load_trunk_artifact(restored_model, artifact, receipt=RECEIPT, synthetic=True)
+        restored_optimizer = torch.optim.SGD(train_module.optimizer_groups(restored_model, .0005), lr=.01, momentum=.9)
+        load_resume(restored_model, restored_optimizer, output / "resume.pt")
+        assert record["last_head_parameter_sha256"] == train_module._head_parameter_digest(restored_model)
+        assert record["last_head_parameter_sha256"] != stale["last_head_parameter_sha256"]
+        assert record["selected_config"] == stale["selected_config"]
+        assert {name: cache._sha(destination / name) for name in final_assets} == asset_hashes
+        assert {name: cache._sha(output / name) for name in final_assets} == asset_hashes
+        last_model = load_checkpoint(destination / "last.pt", destination / "last.json",
+                                     trunk_artifact=artifact, synthetic_trunk=True)
+        assert train_module._head_parameter_digest(last_model) == record["last_head_parameter_sha256"]
+        assert all(torch.equal(last_model.detect.state_dict()[name], restored_model.detect.state_dict()[name])
+                   for name in last_model.detect.state_dict())
+        assert cache._sha(output / "resume.pt") == checkpoint_sha
+        record_sha = cache._sha(destination / "training.json")
+        if recovery_mode == "inplace":
+            with pytest.raises(ValueError, match="completed runs are immutable"):
+                train_module.experiment(**common, output=destination, resume=True)
+        else:
+            with pytest.raises(FileExistsError):
+                train_module.experiment(**common, output=destination)
+        assert cache._sha(destination / "training.json") == record_sha
+        monkeypatch.setattr(train_module, "train", original_train)
+        monkeypatch.setattr(cache, "_atomic_json", fail_final_record)
+
+    missing_record_output = tmp_path / "missing-presentation-baseline"
+    with pytest.raises(OSError, match="injected final presentation failure"):
+        train_module.experiment(**common, output=missing_record_output)
+    (missing_record_output / "training.json").unlink()
+    missing_record_checkpoint_sha = cache._sha(missing_record_output / "resume.pt")
+    monkeypatch.setattr(cache, "_atomic_json", atomic_json)
+    monkeypatch.setattr(train_module, "train", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("completed resume trained again")))
+    with pytest.raises(ValueError, match="completed checkpoint lacks presentation baseline"):
+        train_module.experiment(**common, output=missing_record_output, resume=True)
+    assert not (missing_record_output / "training.json").exists()
+    assert cache._sha(missing_record_output / "resume.pt") == missing_record_checkpoint_sha
+    monkeypatch.setattr(train_module, "train", original_train)
+
+
 def test_metric_gt_preserves_original_values_without_borrowing_source_heap(tmp_path, monkeypatch):
     import hashlib
     import head_sharing.cache as cache
