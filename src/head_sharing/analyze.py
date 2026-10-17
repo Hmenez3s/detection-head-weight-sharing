@@ -209,8 +209,8 @@ def _validate(manifest_path):
             for region in ("full_detector", "head"):
                 sample = profile.get(region, {})
                 if (sample.get("batch") != batch or sample.get("dtype") != "float32" or
-                        type(sample.get("warmup")) is not int or sample["warmup"] < 0 or
-                        type(sample.get("repetitions")) is not int or sample["repetitions"] < 1 or
+                        sample.get("warmup") != 5 or type(sample.get("warmup")) is not int or
+                        sample.get("repetitions") != 20 or type(sample.get("repetitions")) is not int or
                         sample.get("resolution") != [recipe["imgsz"], recipe["imgsz"]] or
                         not isinstance(sample.get("quantization_boundary"), str)):
                     raise ValueError("inference profile policy mismatch")
@@ -279,6 +279,8 @@ def analyze(input_path, output_path):
                     "conv_macs": p.get("executed_conv_macs", {}).get("conv_macs") if item["measurement"] == "inference" else None,
                     "peak_allocated_bytes": p.get("inference_peak", {}).get("peak_allocated_bytes") if item["measurement"] == "inference" and p.get("inference_peak") else p.get("training_peak", {}).get("peak_allocated_bytes") if p.get("training_peak") else None,
                     "mean_full_ms": p.get("full_detector", {}).get("mean_ms") if item["measurement"] == "inference" else None,
+                    "warmup": p.get("full_detector", {}).get("warmup") if item["measurement"] == "inference" else None,
+                    "repetitions": p.get("full_detector", {}).get("repetitions") if item["measurement"] == "inference" else None,
                     "training_probe_scope": p.get("training_protocol", {}).get("scope") if item["measurement"] == "training" else None})
         profile_table.append(row)
     summary = {"label": "SYNTHETIC" if synthetic else "FROZEN_EVIDENCE", "metric": metric,

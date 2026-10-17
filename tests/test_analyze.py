@@ -142,6 +142,8 @@ def test_synthetic_complete_matrix_figures_and_deterministic_replay(tmp_path, mo
     assert "not evidence of equivalence" in summary["caveat"]
     assert len(list(csv.DictReader((out1 / "paired_deltas.csv").open()))) == 10
     assert len(list(csv.DictReader((out1 / "curves.csv").open()))) == 600
+    inference_rows = [r for r in csv.DictReader((out1 / "profiles.csv").open()) if r["measurement"] == "inference"]
+    assert inference_rows and all(r["warmup"] == "5" and r["repetitions"] == "20" for r in inference_rows)
     assert (out1 / "paired_deltas.svg").read_text().startswith("<?xml")
     assert (out1 / "curves.svg").read_text().startswith("<?xml")
     analyze(manifest, out2)
@@ -167,6 +169,23 @@ def test_rejects_missing_duplicate_and_hash_mismatch(tmp_path):
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError):
         analyze(manifest_path, tmp_path / "hash-out")
+
+
+def test_rejects_noncanonical_inference_timing_after_hash_validation(tmp_path):
+    manifest_path, manifest = fixture(tmp_path)
+    # Rewrite every referenced inference profile and rehash it so validation
+    # reaches the measurement-policy checks rather than stopping at integrity.
+    for item in manifest["profiles"]:
+        if item["measurement"] != "inference":
+            continue
+        path = tmp_path / "evidence" / item["file"]["path"]
+        profile = json.loads(path.read_text())
+        profile["full_detector"].update(warmup=0, repetitions=1)
+        profile["head"].update(warmup=0, repetitions=1)
+        item["file"]["sha256"] = put(tmp_path / "evidence", item["file"]["path"], profile)["sha256"]
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="inference profile policy mismatch"):
+        analyze(manifest_path, tmp_path / "rejected-noncanonical-out")
 
 
 def test_rejects_policy_and_cohort_mismatch(tmp_path):

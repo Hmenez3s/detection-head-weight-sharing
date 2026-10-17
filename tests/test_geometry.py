@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+import torch
+from ultralytics.utils.nms import non_max_suppression
 
 from head_sharing.geometry import COCO80_TO_91, decoded_rows, inverse_boxes, letterbox, targets_xywhn
 
@@ -23,6 +25,15 @@ def test_odd_letterbox_flip_and_exact_inverse():
     row = decoded_rows(model_row, 1, meta=meta)[0]
     assert np.allclose(row["bbox"], [13, 17, 87, 68], atol=1e-5)
     with pytest.raises(ValueError): letterbox(image, 513)
+
+
+def test_frozen_adapter_threshold_boundary_differs_from_native_end2end():
+    row = torch.tensor([[0, 0, 10, 10, .001, 0]], dtype=torch.float32)
+    native = non_max_suppression(row.unsqueeze(0), conf_thres=.001, end2end=True)
+    adapter = decoded_rows(row, 1)
+    assert len(native[0]) == 0
+    assert len(adapter) == 1
+    assert adapter[0]["score"] == pytest.approx(.001)
 
 
 def test_coco_category_map_and_native_decoded_rows():
