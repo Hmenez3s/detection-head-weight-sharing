@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 import threading
 import time
 
@@ -233,6 +234,42 @@ def test_extension_validation_and_concurrent_active_unknown_capacity(tmp_path):
     with pytest.raises(RuntimeErrorSafe, match="aggregate CPU"):
         ledger.reserve(GPU_UUIDS[1], 9, phase="main", cpus=7)
     assert ledger.get_job(second)["status"] == "failed"
+
+
+def test_shared_instance_threads_queue_without_racing_file_lock(tmp_path, monkeypatch):
+    ledger = AllocationLedger(owned(tmp_path))
+    real_open = os.open
+    file_contention, errors = [], []
+    barrier = threading.Barrier(8)
+
+    def observed_open(path, flags, *args, **kwargs):
+        try:
+            return real_open(path, flags, *args, **kwargs)
+        except FileExistsError:
+            if Path(path).name == 'ledger.lock':
+                file_contention.append(True)
+            raise
+
+    monkeypatch.setattr(os, 'open', observed_open)
+
+    def reader():
+        try:
+            barrier.wait(timeout=2)
+            with ledger._locked():
+                time.sleep(.01)  # give competing threads a real acquisition window
+                assert ledger._load()['version'] == 1
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reader) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+    assert not any(thread.is_alive() for thread in threads)
+    assert not errors
+    assert not file_contention
+    assert not (ledger.root/'ledger.lock').exists()
 
 
 def test_authorized_same_uuid_concurrent_reservations_admit_exactly_two(tmp_path):

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import uuid
 
@@ -116,31 +117,41 @@ class AllocationLedger:
                 not (self.root / "LEDGER_OWNER").is_file()):
             raise RuntimeErrorSafe("ledger ownership proof missing or path is noncanonical/linked")
         self.clock = clock
+        self._thread_lock = threading.Lock()
 
     @contextmanager
     def _locked(self):
         lock = self.root / "ledger.lock"
         deadline = time.monotonic() + LEDGER_LOCK_WAIT_SECONDS
-        while True:
-            try:
-                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                break
-            except (FileExistsError, PermissionError) as exc:
-                # Windows can deny exclusive creation while a deleted lock is
-                # still open. Wait, never remove it or bypass the mutex.
-                if time.monotonic() >= deadline:
-                    raise RuntimeErrorSafe("ledger lock persists or is inaccessible; operator review required") from exc
-                time.sleep(min(0.05, max(0.005, deadline - time.monotonic())))
+        # Supervisors sharing this instance must queue locally instead of
+        # repeatedly racing each other for the cross-process Windows lock.
+        if not self._thread_lock.acquire(timeout=LEDGER_LOCK_WAIT_SECONDS):
+            raise RuntimeErrorSafe("ledger thread lock persists; operator review required")
         try:
-            os.write(fd, json.dumps({"pid": os.getpid(), "created": self.clock()}).encode())
-            os.fsync(fd)
-            os.close(fd)
-            yield
-        finally:
+            while True:
+                try:
+                    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    break
+                except (FileExistsError, PermissionError) as exc:
+                    # Never remove or bypass another process's lock. Both
+                    # local queueing and file acquisition share one deadline.
+                    if time.monotonic() >= deadline:
+                        raise RuntimeErrorSafe("ledger lock persists or is inaccessible; operator review required") from exc
+                    time.sleep(min(0.05, max(0.005, deadline - time.monotonic())))
             try:
-                lock.unlink()
-            except FileNotFoundError:
-                pass
+                try:
+                    os.write(fd, json.dumps({"pid": os.getpid(), "created": self.clock()}).encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                yield
+            finally:
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    pass
+        finally:
+            self._thread_lock.release()
 
     def _load(self):
         try:
