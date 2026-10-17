@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Draw assets/looped-head.png: YOLO26n's three heads (top) vs. one shared looped head (bottom).
+"""Draw assets/looped-head.png: the three studied heads, stacked: native, loop_ab2 and loop_a3.
 
-Block height is proportional to channel width; colors mark separate sets of weights.
-Proposed-head compute is a design estimate, not a measurement.
+Block height is proportional to channel width; blue/orange/green mark weights of one scale and
+purple marks weights shared by P, M and G. Looped-head compute is a design estimate, not a measurement.
 """
 from pathlib import Path
 import matplotlib
@@ -58,119 +58,153 @@ def section(ax, y, title, subtitle):
     ax.text(85, y - 3.6, subtitle, ha="center", fontsize=10.5, color=GREY)
 
 
-fig, ax = plt.subplots(figsize=(17, 21.4), dpi=170)
-ax.set_xlim(0, 170); ax.set_ylim(-2, 212); ax.axis("off")
-ax.text(85, 208.5, "YOLO26n head: original vs. proposed shared looped head", ha="center", va="center",
+fig, ax = plt.subplots(figsize=(17, 33.4), dpi=150)
+ax.set_xlim(0, 170); ax.set_ylim(0, 334); ax.axis("off")
+ax.text(85, 330.5, "YOLO26n detection head: native vs. two looped designs", ha="center", va="center",
         fontsize=20, fontweight="bold", color=INK)
-ax.text(85, 204.6, "block height = number of channels   ·   color = set of weights", ha="center", va="center",
-        fontsize=11, color=GREY)
-
-# ---------------------------------------------------------------- ORIGINAL (top)
-section(ax, 196, "ORIGINAL — 3 separate heads × 2 layers",
-        "each scale has its own weights  ·  each head runs on its own map")
-ax.text(46, 186.2, "layer 1", ha="center", fontsize=9, color=GREY)
-ax.text(64, 186.2, "layer 2", ha="center", fontsize=9, color=GREY)
-ax.text(78, 186.2, "output", ha="center", fontsize=9, color=GREY)
-for s, y in (("P", 176), ("M", 158), ("G", 140)):
-    c = SCALE[s]
-    scale_input(ax, 6, s, y)
-    yb, yc = y + 4.6, y - 3.2
-    arrow(ax, (20.3, y + 1), (34.8, yb)); arrow(ax, (20.3, y - 1), (34.8, yc))
-    for x in (35, 53):
-        box(ax, x, yb, 11, H(16), c, alpha=.55)
-        box(ax, x, yc, 11, H(80), c, alpha=.25)
-    seg(ax, [46.2, 52.8], [yb, yb]); seg(ax, [46.2, 52.8], [yc, yc])
-    seg(ax, [64.2, 76.3], [yb, yb]); seg(ax, [64.2, 76.3], [yc, yc])
-    box(ax, 76.5, yb, 3, H(4) + .4, c, alpha=.8); box(ax, 76.5, yc, 3, H(80), c, alpha=.5)
-    seg(ax, [79.7, 84], [yb, y]); seg(ax, [79.7, 84], [yc, y])
-    arrow(ax, (84, y), (87.5, y))
-    ax.text(88.4, y, f"{s} predictions", va="center", fontsize=10, color=c, fontweight="bold")
-ax.text(106, 172, "thin row: box  ·  conv 3×3  ·  16 ch", fontsize=10, color=INK)
-ax.text(106, 167.5, "tall row: class  ·  separable 3×3  ·  80 ch", fontsize=10, color=INK)
-ax.text(106, 160, "Layer 1 also compresses each scale\n(64 / 128 / 256 ch) to the tower width.",
-        fontsize=9.5, color=GREY, va="top", linespacing=1.5)
-ax.text(106, 150, "What the P head learns never\nreaches M or G.", fontsize=9.5, color=GREY, va="top",
-        linespacing=1.5)
-seg(ax, [6, 164], [131, 131], RULE, 1.2)
-
-# ---------------------------------------------------------------- PROPOSED (bottom)
-section(ax, 124, "PROPOSED — 1 shared head: one layer × 3 passes, run once on all points",
-        "per-scale adapters, then the same purple weights for P, M and G  ·  box and class stay separate")
-YB, YC = 108, 84                             # shared box tower, shared class tower
-ax.text(32, 115.8, "adapter per scale\nsep 3×3 + scale ID", ha="center", va="bottom", fontsize=8.6,
-        color=GREY, linespacing=1.3)
-box_ys, cls_ys = [], []
-BOX_BUS, CLS_BUS = 41.6, 43.6
-for s, y in (("P", 104), ("M", 86), ("G", 68)):
-    c = SCALE[s]
-    scale_input(ax, 6, s, y)
-    yb, yc = y + 4.6, y - 4.4
-    box_ys.append(yb); cls_ys.append(yc)
-    arrow(ax, (20.3, y + 1), (26.8, yb)); arrow(ax, (20.3, y - 1), (26.8, yc))
-    box(ax, 27, yb, 5, H(32), c, alpha=.6)
-    box(ax, 27, yc, 5, H(112), c, alpha=.35)
-    for yy in (yb, yc):
-        seg(ax, [32.2, 35.3], [yy, yy])
-        ax.add_patch(Circle((36.6, yy), 1.25, fc="white", ec=c, lw=1.3, zorder=3))
-        ax.text(36.6, yy, "id", ha="center", va="center", fontsize=6.5, color=c, fontweight="bold", zorder=4)
-    seg(ax, [37.9, BOX_BUS], [yb, yb]); seg(ax, [37.9, CLS_BUS], [yc, yc])
-# two buses gather the three scales; the box bus is broken where class stubs pass
-crossings = sorted(v for v in cls_ys if min(box_ys) < v < max(box_ys))
-edges = [min(box_ys)] + [e for v in crossings for e in (v - .9, v + .9)] + [max(box_ys)]
-for lo, hi in zip(edges[::2], edges[1::2]):
-    seg(ax, [BOX_BUS, BOX_BUS], [lo, hi])
-seg(ax, [CLS_BUS, CLS_BUS], [min(cls_ys), max(cls_ys)])
-for bus, yt in ((BOX_BUS, YB), (CLS_BUS, YC)):
-    seg(ax, [bus, 47], [yt, yt])
-    point_list(ax, 47, yt, 11)
-    arrow(ax, (58.2, yt), (69.8, yt), SHARED, lw=1.4)
-ax.text(52.5, YB + 2.8, "1 list · 5,376 points", ha="center", fontsize=8.6, color=INK, fontweight="bold")
-ax.text(52.5, YB - 2.6, "4,096 P · 1,024 M · 256 G", ha="center", va="top", fontsize=7.3, color=GREY)
-
-ax.add_patch(FancyBboxPatch((61, 70.5), 46, 48.6, boxstyle="round,pad=0.2,rounding_size=1.5",
-                            fc="#F6F2FD", ec=SHARED, lw=1.2, ls="--", zorder=.8))
-ax.text(84, 116.6, "shared by P, M and G", ha="center", fontsize=10, color=SHARED, fontweight="bold")
-ax.text(84, 97.2, "each pass:  h ← h + 0.1 · F(h)", ha="center", fontsize=9.5, color=SHARED)
+ax.text(85, 326.4, "block height = number of channels   ·   blue / orange / green = weights of one scale   ·   "
+        "purple = weights shared by P, M and G", ha="center", va="center", fontsize=11, color=GREY)
+ax.text(85, 322.9, "one internal copy is drawn; native is the existing control, the two looped arms are not yet trained", ha="center",
+        va="center", fontsize=10, color=GREY)
 
 
-def tower(yt, height, name, width_label, rad, lift):
-    x1, cx = 70, 96.5
-    box(ax, x1, yt, 14, height, SHARED, name if height > 4 else "", fs=12, alpha=.3, bold=True, tc=SHARED)
-    if height <= 4:
-        ax.text(x1 + 7, yt + 2.8, name, ha="center", fontsize=9.5, color=SHARED, fontweight="bold")
-    arrow(ax, (84.2, yt), (95.1, yt), SHARED)
-    ax.add_patch(Circle((cx, yt), 1.3, fc="white", ec=SHARED, lw=1.5, zorder=3))
-    ax.text(cx, yt, "+", ha="center", va="center", fontsize=11, color=SHARED, fontweight="bold", zorder=4)
-    low = yt - height / 2 - 2
-    seg(ax, [63.5, 63.5, cx], [yt, low, low], SHARED, 1.2, 1.6)
-    arrow(ax, (cx, low), (cx, yt - 1.4), SHARED)
-    arrow(ax, (cx + 1, yt + 1), (69.4, yt + lift), SHARED, rad=rad, lw=2, ms=14)
-    ax.text(cx + 2.3, yt + 3.2, "×3", fontsize=11, color=SHARED, fontweight="bold")
-    ax.text(77.6, low - 2.4, width_label, ha="center", fontsize=8.6, color=SHARED)
+# ---------------------------------------------------------------- NATIVE
+def native_panel(T):
+    section(ax, T, "NATIVE — three separate heads, two blocks per branch",
+            "weights separate per scale  ·  each head runs on its own map  ·  24 conv applications per internal copy")
+    for x, t in ((46, "block 1"), (64, "block 2"), (78, "output")):
+        ax.text(x, T - 9.8, t, ha="center", fontsize=9, color=GREY)
+    for s, dy in (("P", -20), ("M", -37.5), ("G", -55)):
+        y, c = T + dy, SCALE[s]
+        scale_input(ax, 6, s, y)
+        yb, yc = y + 4.6, y - 3.2
+        arrow(ax, (20.3, y + 1), (34.8, yb)); arrow(ax, (20.3, y - 1), (34.8, yc))
+        for x in (35, 53):
+            box(ax, x, yb, 11, H(16), c, alpha=.55)
+            box(ax, x, yc, 11, H(80), c, alpha=.25)
+        seg(ax, [46.2, 52.8], [yb, yb]); seg(ax, [46.2, 52.8], [yc, yc])
+        seg(ax, [64.2, 76.3], [yb, yb]); seg(ax, [64.2, 76.3], [yc, yc])
+        box(ax, 76.5, yb, 3, H(4) + .4, c, alpha=.8); box(ax, 76.5, yc, 3, H(80), c, alpha=.5)
+        seg(ax, [79.7, 84], [yb, y]); seg(ax, [79.7, 84], [yc, y])
+        arrow(ax, (84, y), (87.5, y))
+        ax.text(88.4, y, f"{s} predictions", va="center", fontsize=10, color=c, fontweight="bold")
+    x0 = 110
+    ax.text(x0, T - 17, "thin row · box branch", fontsize=10, color=INK, fontweight="bold")
+    ax.text(x0, T - 18.8, "conventional 3×3 conv → 16 ch, twice,\nthen 1×1 → 4 box outputs", fontsize=9.5,
+            color=INK, va="top", linespacing=1.4)
+    ax.text(x0, T - 29, "tall row · class branch", fontsize=10, color=INK, fontweight="bold")
+    ax.text(x0, T - 30.8, "separable 3×3 → 80 ch, twice,\nthen 1×1 → 80 class outputs", fontsize=9.5,
+            color=INK, va="top", linespacing=1.4)
+    ax.text(x0, T - 40.6, "each separable block = depthwise 3×3 + pointwise 1×1,\ntwo primitive convs",
+            fontsize=9, color=GREY, va="top", linespacing=1.4)
+    ax.text(x0, T - 47.6, "Block 1 adapts each scale (64 / 128 / 256 ch)\nto the tower width. Head weights are not shared\n"
+            "across P, M and G.", fontsize=9, color=GREY, va="top", linespacing=1.4)
+    seg(ax, [6, 164], [T - 65, T - 65], RULE, 1.2)
 
 
-tower(YB, H(32), "B", "box · one 1×1 layer · 32 ch", .35, 1.6)
-tower(YC, H(112), "A", "class · one 1×1 layer · 112 ch", .45, 6.6)
-for yt, h, label in ((YB, H(4) + .4, "boxes"), (YC, H(80), "classes")):
-    seg(ax, [97.8, 110.8], [yt, yt], SHARED)
-    box(ax, 111, yt, 3, h, SHARED, alpha=.55)
-    seg(ax, [114.2, 117], [yt, yt])
-    point_list(ax, 117, yt, 11)
-    arrow(ax, (128.2, yt), (131, yt))
-    ax.text(131.8, yt, f"{label}, split back\nto P, M and G", va="center", fontsize=9.6, color=INK,
-            fontweight="bold", linespacing=1.35)
-ax.text(112.5, 113.5, "output", ha="center", fontsize=9, color=GREY)
-ax.text(106, 66.5, "Adapters keep each scale's own 3×3 view of its grid. The loop only uses 1×1 layers, so a "
-        "point's\ngrid does not matter: P, M and G points can share one list and each layer runs once per pass.",
-        ha="center", va="top", fontsize=9.2, color=GREY, linespacing=1.45)
-seg(ax, [6, 164], [55.5, 55.5], RULE, 1.2)
+# ---------------------------------------------------------------- LOOPED ARMS
+def looped_panel(T, title, subtitle, wb, wc, layers, passes, formula):
+    """Draw one looped arm. `layers` are the shared layers inside F: ('A',) or ('A', 'B')."""
+    section(ax, T, title, subtitle)
+    YB, YC = T - 16, T - 40                  # box tower, class tower
+    ax.text(32, T - 8.4, "one adapter per scale, per tower: DW 3×3 on input ch\n+ 1×1 → W + learned scale ID (id)", ha="center",
+            va="bottom", fontsize=8.4, color=GREY, linespacing=1.3)
+    box_ys, cls_ys = [], []
+    BOX_BUS, CLS_BUS = 41.6, 43.6
+    for s, dy in (("P", -20), ("M", -38), ("G", -56)):
+        y, c = T + dy, SCALE[s]
+        scale_input(ax, 6, s, y)
+        yb, yc = y + 4.6, y - 4.4
+        box_ys.append(yb); cls_ys.append(yc)
+        arrow(ax, (20.3, y + 1), (26.8, yb)); arrow(ax, (20.3, y - 1), (26.8, yc))
+        box(ax, 27, yb, 5, H(wb), c, alpha=.6)
+        box(ax, 27, yc, 5, H(wc), c, alpha=.35)
+        for yy in (yb, yc):
+            seg(ax, [32.2, 35.3], [yy, yy])
+            ax.add_patch(Circle((36.6, yy), 1.25, fc="white", ec=c, lw=1.3, zorder=3))
+            ax.text(36.6, yy, "id", ha="center", va="center", fontsize=6.5, color=c, fontweight="bold", zorder=4)
+        seg(ax, [37.9, BOX_BUS], [yb, yb]); seg(ax, [37.9, CLS_BUS], [yc, yc])
+    # two buses gather the three scales; the box bus is broken where class stubs pass
+    crossings = sorted(v for v in cls_ys if min(box_ys) < v < max(box_ys))
+    edges = [min(box_ys)] + [e for v in crossings for e in (v - .9, v + .9)] + [max(box_ys)]
+    for lo, hi in zip(edges[::2], edges[1::2]):
+        seg(ax, [BOX_BUS, BOX_BUS], [lo, hi])
+    seg(ax, [CLS_BUS, CLS_BUS], [min(cls_ys), max(cls_ys)])
+    for bus, yt in ((BOX_BUS, YB), (CLS_BUS, YC)):
+        seg(ax, [bus, 46], [yt, yt])
+        point_list(ax, 46, yt, 11)
+        arrow(ax, (57.2, yt), (68.2, yt), SHARED, lw=1.4)
+    ax.text(51.5, YB + 2.8, "flatten + concat", ha="center", fontsize=8.4, color=INK, fontweight="bold")
+    ax.text(51.5, YB - 2.2, "5,376 points", ha="center", va="top", fontsize=8.4, color=INK, fontweight="bold")
+    ax.text(51.5, YB - 5.2, "4096 P | 1024 M | 256 G", ha="center", va="top", fontsize=6.9, color=GREY)
 
-# ---------------------------------------------------------------- UNROLLED PATH (stacked)
-ax.text(85, 50.5, "The path of one location through the class tower", ha="center", fontsize=12.5,
+    ax.add_patch(FancyBboxPatch((63, T - 56.4), 46.6, 51.4, boxstyle="round,pad=0.2,rounding_size=1.5",
+                                fc="#F6F2FD", ec=SHARED, lw=1.2, ls="--", zorder=.8))
+    ax.text(86.3, T - 7.0, "loop weights shared by P, M and G", ha="center", fontsize=10, color=SHARED,
+            fontweight="bold")
+    ax.text(86.3, T - 54.2, formula, ha="center", fontsize=9.3, color=SHARED)
+
+    n = len(layers)
+    bw = 9 if n == 2 else 15                  # block width
+    x1, cx = 67.5, 99
+    xs = [x1 + i * (bw + 3.4) for i in range(n)]
+    end = xs[-1] + bw
+
+    def tower(yt, ch, width_label, rad):
+        h = H(ch)
+        for x, layer in zip(xs, layers):
+            box(ax, x, yt, bw, h, SHARED, layer if h > 4 else "", fs=12, alpha=.3, bold=True, tc=SHARED)
+            if h <= 4:
+                ax.text(x + bw / 2, yt + h / 2 + 1.5, layer, ha="center", fontsize=9.5, color=SHARED,
+                        fontweight="bold")
+        for a, b in zip(xs, xs[1:]):
+            arrow(ax, (a + bw + .2, yt), (b - .2, yt), SHARED)
+        arrow(ax, (end + .2, yt), (cx - 1.5, yt), SHARED)
+        ax.add_patch(Circle((cx, yt), 1.3, fc="white", ec=SHARED, lw=1.5, zorder=3))
+        ax.text(cx, yt, "+", ha="center", va="center", fontsize=11, color=SHARED, fontweight="bold", zorder=4)
+        low = yt - h / 2 - 2
+        seg(ax, [65, 65, cx], [yt, low, low], SHARED, 1.2, 1.6)
+        arrow(ax, (cx, low), (cx, yt - 1.4), SHARED)
+        arrow(ax, (cx + 1, yt + 1), (x1 - .6, yt + h / 2 + .3), SHARED, rad=rad, lw=2, ms=14)
+        ax.text(cx + 2.4, yt + 3.2, f"×{passes}", fontsize=11, color=SHARED, fontweight="bold")
+        ax.text(86.3, low - 2.4, width_label, ha="center", fontsize=8.4, color=SHARED)
+
+    kind = " → ".join(layers)
+    tower(YB, wb, f"box · {kind} · norm + SiLU + 1×1 conv · {wb} ch", .35)
+    tower(YC, wc, f"class · {kind} · norm + SiLU + 1×1 conv · {wc} ch", .45)
+    for yt, ch, label, n_out in ((YB, 4, "boxes", 4), (YC, 80, "classes", 80)):
+        h = H(ch) + (.4 if ch == 4 else 0)
+        seg(ax, [cx + 1.3, 112.8], [yt, yt], SHARED)
+        box(ax, 113, yt, 3, h, SHARED, alpha=.55)
+        ax.text(114.5, yt + h / 2 + 1.3, f"readout\n1×1 → {n_out}", ha="center", va="bottom", fontsize=8,
+                color=SHARED, linespacing=1.2)
+        seg(ax, [116.2, 119], [yt, yt])
+        point_list(ax, 119, yt, 11)
+        arrow(ax, (130.2, yt), (133, yt))
+        ax.text(133.8, yt, f"{label}, split back\nto P, M and G", va="center", fontsize=9.6, color=INK,
+                fontweight="bold", linespacing=1.35)
+    ax.text(106, T - 60.8, "Adapters are specific to each scale and still run 3 times. In the loop, the only operations are 1×1 convs with "
+            "per-point channel norm,\nso P, M and G points share one list and every layer is applied once per pass to all 5,376 points; "
+            "no 3×3 and no statistics\nacross points or scales. Scale IDs let the loop behave differently per scale; they do not guarantee that conflicts disappear.",
+            ha="center", va="top", fontsize=9, color=GREY, linespacing=1.45)
+    seg(ax, [6, 164], [T - 70.4, T - 70.4], RULE, 1.2)
+
+
+native_panel(316)
+looped_panel(243, "LOOP_AB2 — two layers A → B per tower, 2 passes",
+             "box 24 · class 96 channels  ·  box and class do not share weights  ·  22 conv applications per internal copy",
+             24, 96, ("A", "B"), 2, "each pass:  h ← h + 0.1 · F(h),   F = B(A(h))")
+looped_panel(170, "LOOP_A3 — one layer A per tower, 3 passes",
+             "box 28 · class 108 channels  ·  box and class do not share weights  ·  20 conv applications per internal copy",
+             28, 108, ("A",), 3, "each pass:  h ← h + 0.1 · F(h),   F = A(h)")
+
+
+# ---------------------------------------------------------------- UNROLLED PATHS (stacked)
+ax.text(85, 92, "The path of one location through the class tower", ha="center", fontsize=12.5,
         fontweight="bold", color=INK)
 
 
-def path(y, label, steps, note, out_color):
+def path(y, label, steps, note, out_color, out_text="out"):
     ax.text(6, y + 5.2, label, fontsize=10, fontweight="bold", color=INK)
     box(ax, 6, y, 6, 4.6, SCALE["P"], "in", fs=8, alpha=.1)
     x, end = 15, 12.2
@@ -180,40 +214,46 @@ def path(y, label, steps, note, out_color):
         tc = SHARED if color == SHARED else INK
         box(ax, x, y, w, H(80) * .62, color, text, fs=8.5, alpha=.3, tc=tc, bold=color == SHARED)
         if top:
-            ax.text(x + w / 2, y + 3.9, top,
-                    ha="center", fontsize=7.8, color=SHARED)
+            ax.text(x + w / 2, y + 3.9, top, ha="center", fontsize=7.8, color=SHARED)
         x += w + gap
-    arrow(ax, (end, y), (x - .2, y)); box(ax, x, y, 6, 4.6, out_color, "out", fs=8, alpha=.4,
-                                              tc=SHARED if out_color == SHARED else INK)
-    ax.text(x + 9, y, note, va="center", fontsize=9.3, color=GREY)
+    arrow(ax, (end, y), (x - .2, y))
+    box(ax, x, y, 7, 4.6, out_color, out_text, fs=8, alpha=.4, tc=SHARED if out_color == SHARED else INK)
+    ax.text(x + 10, y, note, va="center", fontsize=9.3, color=GREY)
 
 
-path(40, "original", [("sep 3×3 · 80", SCALE["P"], 13, 3.4, ""), ("sep 3×3 · 80", SCALE["P"], 13, 3.4, "")],
-     "2 layers, used once, weights of this scale only", SCALE["P"])
-path(25, "proposed", [("adapter · 112", SCALE["P"], 13, 3.4, ""), ("A", SHARED, 7, 3.4, "pass 1"),
-                      ("A", SHARED, 7, 3.4, "pass 2"), ("A", SHARED, 7, 3.4, "pass 3")],
-     "adapter + 3 layers · the same A in every pass and for P, M and G", SHARED)
+path(81, "native", [("DW 3×3 + PW · 80", SCALE["P"], 17, 3.4, ""), ("DW 3×3 + PW · 80", SCALE["P"], 17, 3.4, "")],
+     "2 blocks, used once, weights of this scale only", SCALE["P"])
+path(67, "loop_ab2", [("adapter · 96", SCALE["P"], 17, 3.4, ""), ("A", SHARED, 7, 3.4, "pass 1"),
+                      ("B", SHARED, 7, 3.4, ""), ("A", SHARED, 7, 3.4, "pass 2"), ("B", SHARED, 7, 3.4, "")],
+     "this scale's adapter, then the same A and B twice for P, M and G", SHARED, "readout")
+path(53, "loop_a3", [("adapter · 108", SCALE["P"], 17, 3.4, ""), ("A", SHARED, 7, 3.4, "pass 1"),
+                     ("A", SHARED, 7, 3.4, "pass 2"), ("A", SHARED, 7, 3.4, "pass 3")],
+     "this scale's adapter, then the same A three times for P, M and G", SHARED, "readout")
+seg(ax, [6, 164], [44.5, 44.5], RULE, 1.2)
 
 # ---------------------------------------------------------------- NUMBERS
-rows_txt = [("", "original", "proposed"),
-            ("width", "box 16 · class 80", "box 32 · class 112"),
-            ("depth per tower", "2 layers + output", "adapter + 3 passes × 1 layer + output"),
-            ("how often a layer runs", "3×, once per scale", "adapters 3× · loop layers once per pass"),
-            ("normalization", "BatchNorm", "per point: no statistics mixed across scales"),
-            ("head compute", "385 M MACs (measured)", "≈ 684 M MACs (estimate, ≈ 1.8×)")]
-ax.add_patch(FancyBboxPatch((14, 1.2), 142, 15.4, boxstyle="round,pad=0.2,rounding_size=1",
+rows_txt = [("", "native", "loop_ab2", "loop_a3"),
+            ("channel width", "box 16 · class 80", "box 24 · class 96", "box 28 · class 108"),
+            ("what is reused", "nothing across scales", "A, B shared by P, M, G", "A shared by P, M, G"),
+            ("applications per point", "2 blocks", "A → B twice = 4", "A three times = 3"),
+            ("conv applications / internal copy", "24", "22", "20"),
+            ("spatial view of the input map", "5×5", "3×3 (adapter only)", "3×3 (adapter only)"),
+            ("head MACs, both internal branches", "384.6 M (counted)", "≈ 631.4 M (estimate)",
+             "≈ 636.9 M (estimate)")]
+ax.add_patch(FancyBboxPatch((8, 17.8), 154, 21.4, boxstyle="round,pad=0.2,rounding_size=1",
                             fc="#F9FAFB", ec=RULE, lw=1, zorder=.5))
-for i, (a, b, c) in enumerate(rows_txt):
-    yy = 15 - i * 2.5
-    weight = "bold" if i == 0 else "normal"
-    ax.text(52, yy, a, ha="right", va="center", fontsize=10, color=INK, fontweight="bold")
-    ax.text(76, yy, b, ha="center", va="center", fontsize=10, color=SCALE["P"] if i == 0 else INK,
-            fontweight=weight)
-    ax.text(122, yy, c, ha="center", va="center", fontsize=10, color=SHARED if i == 0 else INK,
-            fontweight=weight)
-ax.text(85, -0.8, "YOLO26n runs two internal copies of its head; the figure shows one and compute counts both. "
-        "Nothing has been trained; proposed numbers are estimates.", ha="center", va="center", fontsize=8.6,
-        color=GREY)
+for i, row in enumerate(rows_txt):
+    yy = 37.6 - i * 2.9
+    ax.text(52, yy, row[0], ha="right", va="center", fontsize=10, color=INK, fontweight="bold")
+    for xc, txt, col in zip((70, 103, 137), row[1:], (SCALE["P"], SHARED, SHARED)):
+        ax.text(xc, yy, txt, ha="center", va="center", fontsize=10, color=col if i == 0 else INK,
+                fontweight="bold" if i == 0 else "normal")
+ax.text(85, 14.6, "MACs are for the head only at 512 px and count both internal branches (one2many and one2one) of the end-to-end "
+        "YOLO26n head; native is counted in the unfused reference,\nloop values are design estimates. "
+        "A fused deployed head keeps one branch: ≈ 192 M native, ≈ 316 M loop_ab2, ≈ 318 M loop_a3. Not latency. "
+        "Spatial view = 3×3 or 5×5 on the head's input feature map.\nConv applications count layer applications per internal copy "
+        "(not GPU kernels). The two looped arms have not yet been trained.", ha="center", va="top", fontsize=8.4, color=GREY,
+        linespacing=1.5)
 
 OUT.parent.mkdir(parents=True, exist_ok=True)
 fig.savefig(OUT, bbox_inches="tight", facecolor="white")
