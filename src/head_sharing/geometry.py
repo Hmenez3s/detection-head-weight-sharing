@@ -68,8 +68,8 @@ def decoded_rows(rows, image_id: int, category_map=COCO80_TO_91, conf_threshold:
         raise ValueError("decoded rows must have shape (N,6)")
     if not np.isfinite(arr).all():
         raise ValueError("decoded rows must be finite")
-    if np.any(arr[:, 2] < arr[:, 0]) or np.any(arr[:, 3] < arr[:, 1]):
-        raise ValueError("decoded boxes must have nonnegative width and height")
+    # Native YOLO26 end-to-end export preserves finite inverted endpoints.
+    # Keep their signed sizes for COCOeval, rather than swapping or dropping.
     if not np.isfinite(conf_threshold) or max_det < 1:
         raise ValueError("invalid confidence threshold or max_det")
     selected = arr[arr[:,4] >= conf_threshold]

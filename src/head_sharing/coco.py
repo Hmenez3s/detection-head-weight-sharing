@@ -34,9 +34,10 @@ def score(annotation: dict, image_ids: list[int], predictions: list[dict]) -> di
         score_value = pred.get("score")
         if (not isinstance(bbox, (list, tuple)) or len(bbox) != 4
                 or any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in bbox)
-                or not isinstance(score_value, (int, float)) or not math.isfinite(score_value)
-                or bbox[2] < 0 or bbox[3] < 0):
-            raise ValueError("prediction bbox and score must be finite with nonnegative dimensions")
+                or not isinstance(score_value, (int, float)) or not math.isfinite(score_value)):
+            raise ValueError("prediction bbox and score must be finite")
+        # Match native YOLO26 JSON export: signed dimensions are passed through.
+        # COCO.loadRes computes area and COCOeval owns its area/ignore semantics.
     gt = COCO(); gt.dataset = copy.deepcopy(annotation); gt.createIndex()
     if predictions:
         dt = gt.loadRes(predictions)

@@ -31,5 +31,7 @@ def test_coco_category_map_and_native_decoded_rows():
     assert len(pred) == 1 and pred[0]["category_id"] == 13 and pred[0]["bbox"] == [1.,2.,10.,10.]
     with pytest.raises(ValueError, match="finite"):
         decoded_rows(np.array([[0,0,1,1,np.nan,0]]), 9)
-    with pytest.raises(ValueError, match="nonnegative"):
-        decoded_rows(np.array([[2,0,1,1,.9,0]]), 9)
+    # YOLO26's direct regressor can emit finite inverted endpoints. Native
+    # export retains signed sizes; never swap endpoints or discard detections.
+    inverted = decoded_rows(np.array([[2,0,1,1,.9,0], [0,0,-1,-2,.0001,0]]), 9)
+    assert len(inverted) == 1 and inverted[0]["bbox"] == [2.,0.,-1.,1.]
