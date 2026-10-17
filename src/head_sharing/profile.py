@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import gc
 import json
 import os
 from pathlib import Path
@@ -78,6 +80,31 @@ def measure_conv_macs(model, invoke):
 
 def _sync(torch, device):
     torch.cuda.synchronize(device)
+
+
+def _fused_inference_copy(model, torch):
+    """Prepare an independent CPU copy and prove Detect.fuse preserves native outputs."""
+    fused = copy.deepcopy(model).cpu().eval()
+    source = copy.deepcopy(model).cpu().eval()
+    height = model.imgsz
+    features = [torch.zeros(1, channels, height // stride, height // stride)
+                for channels, stride in ((64, 8), (128, 16), (256, 32))]
+    with torch.inference_mode():
+        retained = source.forward_features(features)
+        fused.detect.fuse()
+        deployed = fused.forward_features(features)
+    expected_raw = retained[1]["one2one"]
+    actual_raw = deployed[1]["one2one"]
+    for key in ("boxes", "scores"):
+        if not torch.allclose(expected_raw[key], actual_raw[key], rtol=1e-6, atol=1e-6):
+            raise ValueError(f"Detect.fuse changed native one2one raw {key}")
+    if not torch.allclose(retained[0], deployed[0], rtol=1e-6, atol=1e-6):
+        raise ValueError("Detect.fuse changed native decoded one2one output")
+    if fused.detect.cv2 is not None or fused.detect.cv3 is not None:
+        raise ValueError("Detect.fuse did not remove the unused one2many branch")
+    del source, retained, deployed, features
+    gc.collect()
+    return fused
 
 
 def _training_batch_size(requested, recipe_batch_size):
@@ -159,6 +186,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--measurement", choices=("inference", "training"), default="inference")
+    parser.add_argument("--inference-policy", choices=("retained_dual", "fused_one2one"), default="retained_dual",
+                         help="inference branch policy; training always uses retained_dual")
     parser.add_argument("--weights", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--trunk-artifact", required=True)
@@ -173,6 +202,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.imgsz <= 0 or args.imgsz % 32 or args.batch_size < 1 or args.warmup < 0 or args.repetitions < 1:
         parser.error("invalid image size, batch, warmup, or repetitions")
+    if args.measurement == "training" and args.inference_policy != "retained_dual":
+        parser.error("training requires --inference-policy retained_dual")
     if args.measurement == "training" and (not args.cache or args.epochs < 3):
         parser.error("training requires --cache and epochs >= 3")
     if args.device == "cpu" and not args.synthetic: parser.error("CPU requires explicit synthetic fixture mode")
@@ -241,21 +272,27 @@ def main(argv=None):
     files={"head_weights":args.weights,"head_config":args.config,"trunk_artifact":args.trunk_artifact}
     before={name:hashlib.sha256(Path(path).read_bytes()).hexdigest() for name,path in files.items()}
     artifact=torch.load(args.trunk_artifact,map_location="cpu",weights_only=True) if args.synthetic else args.trunk_artifact
-    model=load_checkpoint(args.weights,args.config,trunk_artifact=artifact,synthetic_trunk=args.synthetic,map_location="cpu").to(device)
+    model=load_checkpoint(args.weights,args.config,trunk_artifact=artifact,synthetic_trunk=args.synthetic,map_location="cpu")
     if model.imgsz!=args.imgsz: raise ValueError("checkpoint resolution differs from profile")
+    if args.measurement == "inference" and args.inference_policy == "fused_one2one":
+        model = _fused_inference_copy(model, torch)
+    model = model.to(device)
     assigned_uuid=recipe["gpu_for_seed"].get(str(model.seed))
     if device.type=="cuda" and assigned_uuid!=args.uuid:
         raise RuntimeError("execution UUID differs from frozen seed assignment")
-    sizes={"head":storage_inventory(model.detect,args.weights),"full_detector":storage_inventory(model.detector)}
+    branch_policy = args.inference_policy if args.measurement == "inference" else "retained_dual"
+    sizes={"head":storage_inventory(model.detect, args.weights if branch_policy == "retained_dual" else None),
+           "full_detector":storage_inventory(model.detector)}
     head_file_bytes=Path(args.weights).stat().st_size
     trunk_file_bytes=Path(args.trunk_artifact).stat().st_size
     result={"measurement":args.measurement,"arm":model.arm,"seed":model.seed,"imgsz":args.imgsz,
-            "quantization":model.quantization,"numeric_policy":recipe["numeric_policy"],
+            "branch_policy":branch_policy,"quantization":model.quantization,"numeric_policy":recipe["numeric_policy"],
             "model_identity":{"weights_sha256":before["head_weights"],"config_sha256":before["head_config"],
                               "trunk_sha256":recipe["trunk_sha256"],"recipe_sha256":frozen["recipe_sha256"]},
-            "storage":sizes,"portable_weight_files":{"head_file_bytes":head_file_bytes,
+            "storage":sizes,"executable_storage_scope":"unique parameters and tensor storage in the loaded executable model after branch-policy preparation",
+            "portable_weight_files":{"head_file_bytes":head_file_bytes,
                 "common_trunk_file_bytes":trunk_file_bytes,"head_plus_trunk_file_bytes":head_file_bytes+trunk_file_bytes,
-                "scope":"head and common trunk weights containers only; config/receipt bytes excluded"},
+                "scope":"portable source head and common trunk weight containers; config/receipt bytes excluded; distinct from executable post-fuse storage"},
             "producer":recipe["producer"],"assigned_uuid":assigned_uuid,
             "execution_uuid":args.uuid if device.type=="cuda" else None,
             "measurement_inputs":{"batch_size":args.batch_size,"images":"zero-valued FP32 NCHW synthetic/inference tensor",

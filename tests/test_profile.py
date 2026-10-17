@@ -4,7 +4,8 @@ from torch import nn
 
 from head_sharing.model import HeadStudyModel
 from head_sharing.profile import (main, measure_conv_macs, measure_cuda_peak, measure_latency,
-                                  storage_inventory, _fixed_probe_batch, _load_training_cache, _training_batch_size)
+                                  storage_inventory, _fixed_probe_batch, _load_training_cache, _training_batch_size,
+                                  _fused_inference_copy)
 
 
 def test_cli_help_is_available(capsys):
@@ -17,6 +18,7 @@ def test_cli_help_is_available(capsys):
     help_text = capsys.readouterr().out
     assert "--device" in help_text
     assert "--measurement" in help_text
+    assert "--inference-policy" in help_text
     assert "--weights" in help_text
 
 
@@ -201,6 +203,9 @@ def test_persisted_synthetic_cpu_profile_cli_binds_loaded_checkpoint(tmp_path):
                  "--imgsz","64","--batch-size","1","--warmup","0","--repetitions","1","--output",str(output)]) == 0
     result=json.loads(output.read_text())
     assert result["seed"] == 22 and result["arm"] == "native"
+    assert result["branch_policy"] == "retained_dual"
+    assert "post-fuse" in result["portable_weight_files"]["scope"]
+    assert "after branch-policy preparation" in result["executable_storage_scope"]
     assert result["model_identity"]["weights_sha256"] == hashes[weights]
     assert result["model_identity"]["recipe_sha256"]
     assert result["storage"]["head"]["serialized_file_bytes"] == weights.stat().st_size
@@ -214,6 +219,59 @@ def test_persisted_synthetic_cpu_profile_cli_binds_loaded_checkpoint(tmp_path):
     assert result["inference_peak"] is None and result["checkpoint_files_unchanged"] is True
     assert result["checkpoint_file_sha256"] == {"head_weights":hashes[weights],"head_config":hashes[config],"trunk_artifact":hashes[trunk]}
     assert {p:hashlib.sha256(p.read_bytes()).hexdigest() for p in hashes} == hashes
+
+    fused_output = tmp_path / "profile-fused.json"
+    assert main(["--device","cpu","--synthetic","--measurement","inference","--inference-policy","fused_one2one",
+                 "--weights",str(weights),"--config",str(config),"--trunk-artifact",str(trunk),"--protocol",str(protocol),
+                 "--imgsz","64","--batch-size","1","--warmup","0","--repetitions","1","--output",str(fused_output)]) == 0
+    fused_result = json.loads(fused_output.read_text())
+    assert fused_result["branch_policy"] == "fused_one2one"
+    assert fused_result["storage"]["head"]["serialized_file_bytes"] is None
+    assert fused_result["storage"]["head"]["unique_parameters"] < result["storage"]["head"]["unique_parameters"]
+    assert fused_result["inference_peak"] is None
+    assert {p:hashlib.sha256(p.read_bytes()).hexdigest() for p in hashes} == hashes
+
+
+def test_looped_profile_fuse_preserves_selected_outputs_and_counts_real_calls():
+    expected_macs = {"native":384606208,"loop_ab2":631357440,"loop_a3":636919808}
+    expected_calls = {"native":48,"loop_ab2":44,"loop_a3":40}
+    for arm in ("native", "loop_ab2", "loop_a3"):
+        retained = HeadStudyModel(arm, seed=11, imgsz=512).eval()
+        features = [torch.randn(1, channels, side, side) for channels, side in ((64,64),(128,32),(256,16))]
+        with torch.no_grad():
+            retained_output = retained.forward_features(features)
+            macs = measure_conv_macs(retained.detect, lambda: retained.forward_features(features))
+        original_state = {k:v.clone() for k,v in retained.detect.state_dict().items()}
+        retained.train()
+        fused = _fused_inference_copy(retained, torch).eval()
+        assert retained.training  # policy preparation must not change the caller's mode
+        assert all(torch.equal(v, original_state[k]) for k,v in retained.detect.state_dict().items())
+        retained.eval()
+        with torch.no_grad():
+            fused_output = fused.forward_features(features)
+        assert macs["conv_macs"] == expected_macs[arm]
+        assert macs["conv_invocations"] == expected_calls[arm]
+        assert torch.allclose(retained_output[0], fused_output[0], rtol=1e-6, atol=1e-6)
+        for key in ("boxes", "scores"):
+            assert torch.allclose(retained_output[1]["one2one"][key], fused_output[1]["one2one"][key],
+                                  rtol=1e-6, atol=1e-6)
+        assert fused.detect.cv2 is fused.detect.cv3 is None
+        assert retained.detect.cv2 is not None and retained.detect.cv3 is not None
+        fused_macs = measure_conv_macs(fused.detect, lambda: fused.forward_features(features))
+        assert fused_macs["conv_macs"] * 2 == expected_macs[arm]
+        assert fused_macs["conv_invocations"] * 2 == expected_calls[arm]
+
+
+def test_training_policy_rejects_fused_before_protocol_or_filesystem_work(tmp_path, monkeypatch):
+    from head_sharing.profile import main
+    import head_sharing.protocol as protocol
+    called = []
+    monkeypatch.setattr(protocol, "verify_frozen", lambda *args, **kwargs: called.append(True))
+    with pytest.raises(SystemExit):
+        main(["--measurement","training","--inference-policy","fused_one2one","--weights","missing",
+              "--config","missing","--trunk-artifact","missing","--protocol","missing","--cache","missing",
+              "--output",str(tmp_path/"out.json")])
+    assert called == [] and not (tmp_path/"out.json").exists()
 
 
 def _cuda_guard_fixture(tmp_path, monkeypatch, progress_path=None):
