@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "head-sharing"
-version = "0.1.0"
-description = "Controlled head-only weight-sharing study scaffold"
+version = "0.2.0"
+description = "Controlled head-only and cross-scale looped-head studies for YOLO26n"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "torch==2.9.1",
