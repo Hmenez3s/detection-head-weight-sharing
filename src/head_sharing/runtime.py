@@ -86,7 +86,17 @@ def _atomic_json(path: Path, value: object) -> None:
             json.dump(value, stream, sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp_name, path)
+        # Windows readers/AV can briefly deny replacement even for an owned
+        # writable file. Keep the durable temp and lock; never rewrite in place.
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -178,7 +188,11 @@ class AllocationLedger:
         raise RuntimeErrorSafe("unknown reservation")
 
     def get_job(self, token: str):
-        for device in self._load()["devices"].values():
+        # Cooperative reads must not hold a Windows handle across a writer's
+        # atomic replacement. Noncooperative readers are covered by bounded retry.
+        with self._locked():
+            state = self._load()
+        for device in state["devices"].values():
             for job in device["jobs"]:
                 if job["id"] == token:
                     return dict(job)
@@ -213,7 +227,8 @@ def main(argv=None) -> int:
         initialize(args.owned_study_root, args.subroot); return 0
     ledger = AllocationLedger(args.root)
     if args.action == "status":
-        state = ledger._load()
+        with ledger._locked():
+            state = ledger._load()
         public = {device_uuid: {"main": device["main"], "final": device["final"],
                                 "contingency": device["contingency"],
                                 "jobs": [{key: job.get(key) for key in ("id", "phase", "seconds", "cpus", "status", "pid", "started", "ended", "exit_code", "progress")}

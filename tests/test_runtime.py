@@ -157,3 +157,57 @@ def test_torch_bare_uuid_matches_nvml_identity_but_not_other_device(tmp_path):
     for invalid in ('', 'GPU-unknown', GPU_UUIDS[1].replace('-', ''), None):
         with pytest.raises(RuntimeErrorSafe, match='UUID'):
             canonical_gpu_uuid(invalid)
+
+
+def test_transient_windows_sharing_denial_retries_without_losing_charge(tmp_path, monkeypatch):
+    import head_sharing.runtime as runtime
+    ledger = AllocationLedger(owned(tmp_path))
+    replace = runtime.os.replace
+    attempts = []
+    def briefly_busy(source, target):
+        attempts.append(str(target))
+        if len(attempts) == 1:
+            exc = PermissionError('owned file temporarily open without delete sharing')
+            exc.winerror = 5
+            raise exc
+        return replace(source, target)
+    monkeypatch.setattr(runtime.os, 'replace', briefly_busy)
+    token = ledger.reserve(GPU_UUIDS[0], 10, phase='main', cpus=1)
+    assert len(attempts) == 2 and ledger.get_job(token)['seconds'] == 10
+    assert ledger._load()['devices'][GPU_UUIDS[0]]['main'] == 10
+
+
+def test_persistent_sharing_denial_is_bounded_and_keeps_previous_ledger(tmp_path, monkeypatch):
+    import head_sharing.runtime as runtime
+    ledger = AllocationLedger(owned(tmp_path))
+    before = (ledger.root/'ledger.json').read_bytes()
+    calls = []
+    def always_busy(source, target):
+        calls.append(target)
+        exc = PermissionError('persistent denial')
+        exc.winerror = 32
+        raise exc
+    clock = iter([0.0, 2.0])
+    monkeypatch.setattr(runtime.os, 'replace', always_busy)
+    monkeypatch.setattr(runtime.time, 'monotonic', lambda: next(clock))
+    with pytest.raises(PermissionError):
+        runtime._atomic_json(ledger.root/'ledger.json', {'must_not_replace': True})
+    assert len(calls) == 1 and (ledger.root/'ledger.json').read_bytes() == before
+    assert not list(ledger.root.glob('.ledger-*'))
+
+
+def test_job_reader_waits_for_cooperating_writer(tmp_path):
+    ledger = AllocationLedger(owned(tmp_path))
+    token = ledger.reserve(GPU_UUIDS[0], 10, phase='main', cpus=1)
+    ready = threading.Event()
+    def writer():
+        with ledger._locked():
+            ready.set()
+            time.sleep(.1)
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert ready.wait(2)
+    try:
+        assert ledger.get_job(token)['id'] == token
+    finally:
+        thread.join(2)
