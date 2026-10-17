@@ -2,6 +2,8 @@
 
 A controlled, head-only YOLO26n study finds a clear downside in this setting: applying one refinement block twice with tied weights scored **4.87 AP points below** two independent copies. The shared-weight arm was lower in **all five paired seeds**. This is evidence about one fixed protocol and one inherited trunk—not a general verdict on weight sharing.
 
+> **Scope — what this study does not test.** `shared_k2` repeats one existing convolutional unit twice *inside each* of the separate per-scale heads. There is no residual update, only two applications, and the repeated unit's BatchNorm running statistics are shared across both passes. It does **not** test a single looped head shared across the P3/P4/P5 scales in place of the three heads, nor a residual recurrent refiner such as `h ← h + α·F(h)`. These results are not evidence against either design.
+
 All 15 training runs completed 40 epochs. The selected checkpoints were evaluated on all 5,000 COCO val2017 images, and all 24 declared CUDA profiles were collected. No further experiments or tuning are part of these results.
 
 | Arm | Refinement at each of 12 head sites |
