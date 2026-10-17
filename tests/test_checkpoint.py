@@ -8,6 +8,49 @@ from head_sharing.model import HeadStudyModel
 from head_sharing.train import optimizer_groups
 
 
+def test_looped_heads_strict_checkpoint_and_resume_roundtrip(tmp_path):
+    from head_sharing.checkpoint import load_checkpoint, save_checkpoint
+    receipt = {
+        "trunk_artifact_sha256": "f01ec41445fac9ef7078b48ef1b73473e6314bcb1a77e77c20666d6ecfcd9016",
+        "trunk_tensors": 468, "trunk_bytes": 9_109_168, "head_index": 23,
+        "input_channels": [64, 128, 256], "source_variant": "U", "source_seed": 11,
+        "source_epoch_zero_based": 79, "source_training_epochs": 80,
+        "pre_exposure": "Synthetic test receipt.",
+    }
+    for arm in ("loop_ab2", "loop_a3"):
+        model = HeadStudyModel(arm, 51, 64).eval()
+        features = [torch.randn(1, c, n, n) for c, n in ((64, 8), (128, 4), (256, 2))]
+        optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01, momentum=.9)
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        model.forward_features(features)["one2many"]["boxes"].sum().backward()
+        optimizer.step()
+        assert optimizer.state and all("momentum_buffer" in state for state in optimizer.state.values())
+        model.eval()
+        expected = model.forward_features(features)
+        trunk = {k: v.detach().clone() for k, v in model.detector.state_dict().items()
+                 if k.startswith("model.") and int(k.split(".")[1]) < 23}
+        artifact = {"state_dict": trunk, "schema_version": 1, "architecture": "yolo26n",
+                    "upstream": "8.4.177", "excluded_head_index": 23}
+        weights, config = tmp_path / f"{arm}.pt", tmp_path / f"{arm}.json"
+        save_checkpoint(model, weights, config, receipt)
+        restored = load_checkpoint(weights, config, trunk_artifact=artifact, synthetic_trunk=True)
+        actual = restored.forward_features(features)
+        assert torch.equal(expected[0], actual[0])
+        assert torch.equal(expected[1]["one2one"]["boxes"], actual[1]["one2one"]["boxes"])
+        resume = tmp_path / f"{arm}-resume.pt"
+        save_resume(model, optimizer, resume, epoch=1)
+        restored_optimizer = torch.optim.SGD(optimizer_groups(restored, .0005), lr=.01, momentum=.9)
+        assert load_resume(restored, restored_optimizer, resume) == 1
+        assert all(torch.equal(v, restored.detect.state_dict()[k]) for k, v in model.detect.state_dict().items())
+        model.train(); restored.train()
+        for candidate, candidate_optimizer in ((model, optimizer), (restored, restored_optimizer)):
+            candidate_optimizer.zero_grad(set_to_none=True)
+            candidate.forward_features(features)["one2many"]["boxes"].sum().backward()
+            candidate_optimizer.step()
+        assert all(torch.equal(v, restored.detect.state_dict()[k]) for k, v in model.detect.state_dict().items())
+
+
 def test_resume_restores_python_numpy_and_torch_rng(tmp_path):
     torch.set_num_threads(1)
     model = HeadStudyModel("native", 11, 64)

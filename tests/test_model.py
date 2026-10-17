@@ -88,6 +88,88 @@ def test_facts_intervention_alias_gradients_and_frozen_trunk():
     assert all(p.grad is None for p in shared.detector.model[:-1].parameters())
 
 
+@pytest.mark.parametrize("arm,widths,classes,passes", [("loop_ab2", 24, 96, 2), ("loop_a3", 28, 108, 3)])
+def test_looped_shared_list_native_loss_update_and_fuse(arm, widths, classes, passes):
+    from head_sharing.train import _native_criterion, optimizer_groups
+    torch.set_num_threads(1)
+    rng_before = torch.get_rng_state().clone()
+    model = HeadStudyModel(arm, seed=11, imgsz=64)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert model.detect.cv2[0].adapters[0][1].out_channels == widths
+    assert model.detect.cv3[0].adapters[0][1].out_channels == classes
+    assert model.detect.one2one_cv2[0] is not model.detect.cv2[0]
+    assert model.detect.cv2[0].a is not model.detect.cv3[0].a
+    assert torch.stack(list(model.detect.cv2[0].scale_id)).shape == (3, widths)
+    assert torch.count_nonzero(torch.stack(list(model.detect.cv2[0].scale_id))) == 0
+    assert model.detect.cv2[0].norm_a.eps == 1e-5
+    assert model.detect.cv2[0].a.kernel_size == (1, 1)
+    if arm == "loop_ab2":
+        assert model.detect.cv2[0].a is not model.detect.cv2[0].b
+    assert len([m for m in model.detect.cv2[0].modules() if isinstance(m, torch.nn.Conv2d)]) == 7 + (2 if arm == "loop_ab2" else 1)
+    box_tower, cls_tower = model.detect.cv2[0], model.detect.cv3[0]
+    assert torch.stack(list(box_tower.scale_bias))[:, 0].tolist() == [2.0] * 3
+    expected_class_prior = torch.tensor([
+        __import__("math").log(5 / 80 / (640 / stride) ** 2) for stride in (8, 16, 32)])
+    assert torch.allclose(torch.stack(list(cls_tower.scale_bias))[:, 0], expected_class_prior)
+    assert torch.count_nonzero(box_tower.readout.bias) == torch.count_nonzero(cls_tower.readout.bias) == 0
+    assert torch.equal(box_tower.readout.bias[0] + torch.stack(list(box_tower.scale_bias))[:, 0],
+                       torch.full((3,), 2.0))
+    assert torch.equal(cls_tower.readout.bias[0] + torch.stack(list(cls_tower.scale_bias))[:, 0], expected_class_prior)
+    decay, no_decay = optimizer_groups(model, .0005)
+    no_decay_ids = {id(p) for p in no_decay["params"]}
+    scale_parameters = [p for name, p in model.detect.named_parameters()
+                        if "scale_id" in name or "scale_bias" in name]
+    assert len(scale_parameters) == 24 and all(p.ndim == 1 and id(p) in no_decay_ids for p in scale_parameters)
+    assert not ({id(p) for p in scale_parameters} & {id(p) for p in decay["params"]})
+    tower_features = [torch.randn(2, c, n, n) for c, n in ((64, 8), (128, 4), (256, 2))]
+    joint = box_tower(tower_features, arm)
+    by_level = torch.cat([box_tower([feature], arm, level_indices=[index])
+                          for index, feature in enumerate(tower_features)], dim=-1)
+    assert torch.allclose(joint, by_level, atol=1e-6, rtol=1e-6)
+    with torch.no_grad():
+        box_tower.readout.bias.fill_(3.0)
+        cls_tower.readout.bias.fill_(3.0)
+        for bias in box_tower.scale_bias: bias.fill_(-7.0)
+        for bias in cls_tower.scale_bias: bias.fill_(-7.0)
+    model.detect.bias_init()
+    assert torch.count_nonzero(box_tower.readout.bias) == torch.count_nonzero(cls_tower.readout.bias) == 0
+    assert torch.stack(list(box_tower.scale_bias))[:, 0].tolist() == [2.0] * 3
+    assert torch.allclose(torch.stack(list(cls_tower.scale_bias))[:, 0], expected_class_prior)
+    trunk = {k: v.clone() for k, v in model.detector.model[:-1].state_dict().items()}
+    features = [torch.randn(2, c, n, n) for c, n in ((64, 8), (128, 4), (256, 2))]
+    model.train()
+    prediction = model.forward_features(features)
+    assert prediction["one2many"]["boxes"].shape == (2, 4, 84)
+    criterion = _native_criterion(model, 2)
+    targets = {"batch_idx": torch.tensor([0.]), "cls": torch.tensor([[1.]]),
+               "bboxes": torch.tensor([[.5, .5, .2, .2]])}
+    loss, _ = criterion(prediction, targets)
+    assert torch.isfinite(loss).all() and loss.sum().item() > 0
+    optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01, momentum=.9)
+    params = [p for group in optimizer.param_groups for p in group["params"]]
+    assert len(params) == len({id(p) for p in params})
+    head = model.detect.cv2[0].a.weight
+    before = head.detach().clone()
+    optimizer.zero_grad(set_to_none=True); loss.sum().backward(); optimizer.step()
+    assert head.grad is not None and torch.isfinite(head.grad).all() and not torch.equal(before, head)
+    assert all(torch.equal(v, trunk[k]) for k, v in model.detector.model[:-1].state_dict().items())
+    model.eval()
+    unfused = model.forward_features(features)
+    from head_sharing.profile import measure_conv_macs
+    arithmetic = measure_conv_macs(model.detect, lambda: model.forward_features(features))
+    assert arithmetic["conv_invocations"] == (44 if arm == "loop_ab2" else 40)
+    assert arithmetic["conv_macs"] > 0
+    decoded = unfused[0].clone()
+    model.detect.fuse()
+    fused = model.forward_features(features)
+    assert torch.equal(decoded, fused[0])
+    assert torch.equal(unfused[1]["one2one"]["boxes"], fused[1]["one2one"]["boxes"])
+    assert torch.equal(unfused[1]["one2one"]["scores"], fused[1]["one2one"]["scores"])
+    assert model.detect.cv2 is None
+    with pytest.raises(RuntimeError, match="inference-only"):
+        model.train()
+
+
 def test_q_reference_online_features_and_native_decode():
     model = HeadStudyModel("native", seed=22, imgsz=640).eval()
     images = torch.randn(1, 3, 640, 640)

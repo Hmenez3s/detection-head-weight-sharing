@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from . import ALL_ARMS
+
 
 def optimizer_groups(model, weight_decay: float):
     import torch
@@ -427,7 +429,7 @@ def main(argv=None):
             s.add_argument('--protocol', required=True); s.add_argument('--dev-cache', required=True)
             s.add_argument('--probe-cache', required=True); s.add_argument('--annotations', required=True)
     a = p.parse_args(argv)
-    if a.arm not in ('native', 'independent_k2', 'shared_k2'): p.error('unknown arm')
+    if a.arm not in ALL_ARMS: p.error('unknown arm')
     os.environ['NVIDIA_TF32_OVERRIDE'] = '0'; os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
     from .runtime import AllocationLedger, _has_symlink_component, canonical_gpu_uuid
     from .cache import _read_json, _sha, _progress

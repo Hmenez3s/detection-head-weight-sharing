@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 
+from . import ALL_ARMS
 from .model import HeadStudyModel
 
 CONFIG_KEYS = {"format", "architecture", "arm", "seed", "imgsz", "quantization", "trunk_receipt"}
@@ -134,7 +135,7 @@ def _read_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("checkpoint config has unknown or missing fields")
     if type(config["format"]) is not int or config["format"] != 1 or config["architecture"] != "yolo26n":
         raise ValueError("unsupported checkpoint format or architecture")
-    if config["arm"] not in ("native", "independent_k2", "shared_k2"):
+    if config["arm"] not in ALL_ARMS:
         raise ValueError("unknown checkpoint arm")
     if type(config["seed"]) is not int or type(config["imgsz"]) is not int:
         raise ValueError("checkpoint seed and image size must be integers")
