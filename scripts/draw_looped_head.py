@@ -94,7 +94,7 @@ ax.text(106, 150, "What the P head learns never\nreaches M or G.", fontsize=9.5,
 seg(ax, [6, 164], [131, 131], RULE, 1.2)
 
 # ---------------------------------------------------------------- PROPOSED (bottom)
-section(ax, 124, "PROPOSED — 1 shared head: 2 passes × 2 layers, run once on all points",
+section(ax, 124, "PROPOSED — 1 shared head: one layer × 3 passes, run once on all points",
         "per-scale adapters, then the same purple weights for P, M and G  ·  box and class stay separate")
 YB, YC = 108, 84                             # shared box tower, shared class tower
 ax.text(32, 115.8, "adapter per scale\nsep 3×3 + scale ID", ha="center", va="bottom", fontsize=8.6,
@@ -104,11 +104,11 @@ BOX_BUS, CLS_BUS = 41.6, 43.6
 for s, y in (("P", 104), ("M", 86), ("G", 68)):
     c = SCALE[s]
     scale_input(ax, 6, s, y)
-    yb, yc = y + 4.6, y - 3.4
+    yb, yc = y + 4.6, y - 4.4
     box_ys.append(yb); cls_ys.append(yc)
     arrow(ax, (20.3, y + 1), (26.8, yb)); arrow(ax, (20.3, y - 1), (26.8, yc))
-    box(ax, 27, yb, 5, H(24), c, alpha=.6)
-    box(ax, 27, yc, 5, H(96), c, alpha=.35)
+    box(ax, 27, yb, 5, H(32), c, alpha=.6)
+    box(ax, 27, yc, 5, H(112), c, alpha=.35)
     for yy in (yb, yc):
         seg(ax, [32.2, 35.3], [yy, yy])
         ax.add_patch(Circle((36.6, yy), 1.25, fc="white", ec=c, lw=1.3, zorder=3))
@@ -123,7 +123,7 @@ seg(ax, [CLS_BUS, CLS_BUS], [min(cls_ys), max(cls_ys)])
 for bus, yt in ((BOX_BUS, YB), (CLS_BUS, YC)):
     seg(ax, [bus, 47], [yt, yt])
     point_list(ax, 47, yt, 11)
-    arrow(ax, (58.2, yt), (64.6, yt), SHARED, lw=1.4)
+    arrow(ax, (58.2, yt), (69.8, yt), SHARED, lw=1.4)
 ax.text(52.5, YB + 2.8, "1 list · 5,376 points", ha="center", fontsize=8.6, color=INK, fontweight="bold")
 ax.text(52.5, YB - 2.6, "4,096 P · 1,024 M · 256 G", ha="center", va="top", fontsize=7.3, color=GREY)
 
@@ -133,26 +133,24 @@ ax.text(84, 116.6, "shared by P, M and G", ha="center", fontsize=10, color=SHARE
 ax.text(84, 97.2, "each pass:  h ← h + 0.1 · F(h)", ha="center", fontsize=9.5, color=SHARED)
 
 
-def tower(yt, height, names, width_label, rad, lift):
-    x1, x2, cx = 66, 79, 96.5
-    for x, n in zip((x1, x2), names):
-        box(ax, x, yt, 10, height, SHARED, n if height > 4 else "", fs=11, alpha=.3, bold=True, tc=SHARED)
-        if height <= 4:
-            ax.text(x + 5, yt + 2.6, n, ha="center", fontsize=9, color=SHARED, fontweight="bold")
-    arrow(ax, (76.2, yt), (78.8, yt), SHARED)
-    arrow(ax, (89.2, yt), (95.1, yt), SHARED)
+def tower(yt, height, name, width_label, rad, lift):
+    x1, cx = 70, 96.5
+    box(ax, x1, yt, 14, height, SHARED, name if height > 4 else "", fs=12, alpha=.3, bold=True, tc=SHARED)
+    if height <= 4:
+        ax.text(x1 + 7, yt + 2.8, name, ha="center", fontsize=9.5, color=SHARED, fontweight="bold")
+    arrow(ax, (84.2, yt), (95.1, yt), SHARED)
     ax.add_patch(Circle((cx, yt), 1.3, fc="white", ec=SHARED, lw=1.5, zorder=3))
     ax.text(cx, yt, "+", ha="center", va="center", fontsize=11, color=SHARED, fontweight="bold", zorder=4)
     low = yt - height / 2 - 2
     seg(ax, [63.5, 63.5, cx], [yt, low, low], SHARED, 1.2, 1.6)
     arrow(ax, (cx, low), (cx, yt - 1.4), SHARED)
-    arrow(ax, (cx + 1, yt + 1), (65.4, yt + lift), SHARED, rad=rad, lw=2, ms=14)
-    ax.text(cx + 2.3, yt + 3.2, "×2", fontsize=11, color=SHARED, fontweight="bold")
+    arrow(ax, (cx + 1, yt + 1), (69.4, yt + lift), SHARED, rad=rad, lw=2, ms=14)
+    ax.text(cx + 2.3, yt + 3.2, "×3", fontsize=11, color=SHARED, fontweight="bold")
     ax.text(77.6, low - 2.4, width_label, ha="center", fontsize=8.6, color=SHARED)
 
 
-tower(YB, H(24), ("C", "D"), "box · two 1×1 layers · 24 ch", .3, 1.6)
-tower(YC, H(96), ("A", "B"), "class · two 1×1 layers · 96 ch", .42, 5.8)
+tower(YB, H(32), "B", "box · one 1×1 layer · 32 ch", .35, 1.6)
+tower(YC, H(112), "A", "class · one 1×1 layer · 112 ch", .45, 6.6)
 for yt, h, label in ((YB, H(4) + .4, "boxes"), (YC, H(80), "classes")):
     seg(ax, [97.8, 110.8], [yt, yt], SHARED)
     box(ax, 111, yt, 3, h, SHARED, alpha=.55)
@@ -182,7 +180,7 @@ def path(y, label, steps, note, out_color):
         tc = SHARED if color == SHARED else INK
         box(ax, x, y, w, H(80) * .62, color, text, fs=8.5, alpha=.3, tc=tc, bold=color == SHARED)
         if top:
-            ax.text(x + w + gap / 2 if top.startswith("pass") else x + w / 2, y + 3.9, top,
+            ax.text(x + w / 2, y + 3.9, top,
                     ha="center", fontsize=7.8, color=SHARED)
         x += w + gap
     arrow(ax, (end, y), (x - .2, y)); box(ax, x, y, 6, 4.6, out_color, "out", fs=8, alpha=.4,
@@ -192,17 +190,17 @@ def path(y, label, steps, note, out_color):
 
 path(40, "original", [("sep 3×3 · 80", SCALE["P"], 13, 3.4, ""), ("sep 3×3 · 80", SCALE["P"], 13, 3.4, "")],
      "2 layers, used once, weights of this scale only", SCALE["P"])
-path(25, "proposed", [("adapter · 96", SCALE["P"], 13, 3.4, ""), ("A", SHARED, 6, 1.6, "pass 1"),
-                      ("B", SHARED, 6, 3.4, ""), ("A", SHARED, 6, 1.6, "pass 2"), ("B", SHARED, 6, 3.4, "")],
-     "adapter + 4 layers · A and B reused in both passes and by P, M and G", SHARED)
+path(25, "proposed", [("adapter · 112", SCALE["P"], 13, 3.4, ""), ("A", SHARED, 7, 3.4, "pass 1"),
+                      ("A", SHARED, 7, 3.4, "pass 2"), ("A", SHARED, 7, 3.4, "pass 3")],
+     "adapter + 3 layers · the same A in every pass and for P, M and G", SHARED)
 
 # ---------------------------------------------------------------- NUMBERS
 rows_txt = [("", "original", "proposed"),
-            ("width", "box 16 · class 80", "box 24 · class 96"),
-            ("depth per tower", "2 layers + output", "adapter + 2 passes × 2 layers + output"),
+            ("width", "box 16 · class 80", "box 32 · class 112"),
+            ("depth per tower", "2 layers + output", "adapter + 3 passes × 1 layer + output"),
             ("how often a layer runs", "3×, once per scale", "adapters 3× · loop layers once per pass"),
             ("normalization", "BatchNorm", "per point: no statistics mixed across scales"),
-            ("head compute", "385 M MACs (measured)", "≈ 631 M MACs (estimate, ≈ 1.6×)")]
+            ("head compute", "385 M MACs (measured)", "≈ 684 M MACs (estimate, ≈ 1.8×)")]
 ax.add_patch(FancyBboxPatch((14, 1.2), 142, 15.4, boxstyle="round,pad=0.2,rounding_size=1",
                             fc="#F9FAFB", ec=RULE, lw=1, zorder=.5))
 for i, (a, b, c) in enumerate(rows_txt):

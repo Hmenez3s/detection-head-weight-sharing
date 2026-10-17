@@ -1,7 +1,7 @@
 # One looped head for every scale
 
 <p align="center">
-  <img src="assets/looped-head.png" width="100%" alt="Top, original YOLO26n: three separate heads, one per scale, each with two layers. Bottom, proposed: a separable 3×3 adapter and scale ID per scale, then all 5,376 points in one list go through shared box and class loops of two 1×1 layers, run for two passes, and are split back to P, M and G.">
+  <img src="assets/looped-head.png" width="100%" alt="Top, original YOLO26n: three separate heads, one per scale, each with two layers. Bottom, proposed: a separable 3×3 adapter and scale ID per scale, then all 5,376 points in one list go through shared box and class loops of a single 1×1 layer, run for three passes, and are split back to P, M and G.">
 </p>
 
 **Question.** Can one looped detection head, shared by the P, M and G scales, replace YOLO26n's three separate heads? By reusing what it learns about objects at one size for the others, could it detect more accurately at the same or slightly higher compute?
@@ -11,8 +11,8 @@
 ## The idea
 
 - **Today**, each scale has its own head: P for small objects, M for medium, G for large. What the P head learns never reaches M or G.
-- **Proposed**, box and class keep separate towers, as in the original, but **each tower is shared by all three scales and looped**. A per-scale adapter looks at each location's 3×3 neighborhood, brings the scale to the tower's width and adds a learned scale ID. The loop then uses only 1×1 layers, so P, M and G points can go through it **as one list of 5,376 points**: **the same two layers run for two passes** with a residual update `h ← h + 0.1·F(h)`, and the outputs are split back to P, M and G.
-- **The goal is generalization across scales and higher accuracy, not fewer parameters.** The scale ID lets the shared loop treat a pattern differently when its scale matters. One list means one call per layer instead of one per scale; it does not reduce the arithmetic, because the list still holds every point. The head does about 1.6× the original's work; the full detector about 13% more. Latency and memory are measured, not assumed.
+- **Proposed**, box and class keep separate towers, as in the original, but **each tower is shared by all three scales and looped**. A per-scale adapter looks at each location's 3×3 neighborhood, brings the scale to the tower's width and adds a learned scale ID. The loop then uses only 1×1 layers, so P, M and G points can go through it **as one list of 5,376 points**: **the same single layer runs for three passes** with a residual update `h ← h + 0.1·F(h)`, and the outputs are split back to P, M and G.
+- **The goal is generalization across scales and higher accuracy, not fewer parameters.** The scale ID lets the shared loop treat a pattern differently when its scale matters. One list means one call per layer instead of one per scale; it does not reduce the arithmetic, because the list still holds every point. The head does about 1.8× the original's work; the full detector about 16% more. Latency and memory are measured, not assumed.
 
 ## Planned design
 
@@ -20,16 +20,16 @@
 |---|---|---|
 | Heads | 3, one per scale | 1, shared by P, M and G |
 | Towers | separate box and class | separate box and class |
-| Width | box 16 · class 80 | box 24 · class 96 |
-| Depth per tower | 2 layers + output | adapter + 2 passes × 2 layers + output |
+| Width | box 16 · class 80 | box 32 · class 112 |
+| Depth per tower | 2 layers + output | adapter + 3 passes × 1 layer + output |
 | How often a layer runs | 3×, once per scale | adapters 3× · loop layers once per pass, on all points |
 | Sets of weights | 3 per layer | adapters per scale · loop and output shared |
 | Normalization | BatchNorm | per point: no statistics mixed across scales |
-| Head compute | 385 M MACs (measured) | ≈631 M MACs (estimate) |
+| Head compute | 385 M MACs (measured) | ≈684 M MACs (estimate) |
 
 **Why box and class stay separate.** Locating an object and naming it can pull a shared layer in different directions. [YOLOX](https://arxiv.org/abs/2107.08430) found that separating them speeds up training and improves AP; in an end-to-end YOLO, like YOLO26n, a shared box-and-class head lost 4.2 AP versus 0.8 for separate ones. Merging them here would also blur what the experiment measures.
 
-**What the adapter does.** P, M and G arrive with 64, 128 and 256 channels, but a shared tower needs one input width. The adapter compresses each scale to that width, for example 256 → 96 channels for G. The original's first layer already performs the same compression. A separable 3×3 adapter looks at neighboring locations before compressing, as the original class tower does.
+**What the adapter does.** P, M and G arrive with 64, 128 and 256 channels, but a shared tower needs one input width. The adapter compresses each scale to that width, for example 256 → 112 channels for G. The original's first layer already performs the same compression. A separable 3×3 adapter looks at neighboring locations before compressing, as the original class tower does.
 
 ## Planned comparison
 
@@ -44,7 +44,7 @@
 
 All arms use the same frozen YOLO26n trunk and training recipe, five paired seeds, checkpoint selection on a development split, and final evaluation on COCO val2017. AP, latency and memory are reported for every arm.
 
-**Starting point, to confirm before training:** two passes, box 24 and class 96 channels.
+**Starting point, to confirm before training:** one shared layer, three passes, box 32 and class 112 channels. The alternative under consideration is two layers (A → B) for two passes at box 24 and class 96 channels, ≈631 M MACs.
 
 ## Repository
 
