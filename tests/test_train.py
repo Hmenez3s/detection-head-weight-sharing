@@ -66,3 +66,24 @@ for device in ('cpu', 'GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99'):
 """ % base
     proc=subprocess.run([sys.executable, '-c', code], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_metric_gt_preserves_original_values_without_borrowing_source_heap(tmp_path, monkeypatch):
+    import hashlib
+    import head_sharing.cache as cache
+    from head_sharing.train import metric_annotations
+    source = {'images': [{'id': 1}, {'id': 2}], 'categories': [{'id': 17, 'name': 'example'}],
+              'annotations': [{'id': 8, 'image_id': 1, 'category_id': 17, 'iscrowd': 1,
+                  'area': 1234.5678901234567, 'bbox': [10.123456789012345, 20.25, 30.5, 40.75],
+                  'segmentation': [[1.0, 2.0, 3.0, 4.0]]}]}
+    path = tmp_path/'source.json'
+    path.write_text(json.dumps(source))
+    monkeypatch.setattr(cache, '_read_json', lambda p: source)
+    result = metric_annotations(path, hashlib.sha256(path.read_bytes()).hexdigest(), [1])
+    expected = {'images': [source['images'][0]], 'categories': source['categories'],
+                'annotations': [{k: v for k, v in source['annotations'][0].items() if k != 'segmentation'}]}
+    assert result == expected
+    assert result['images'][0] is not source['images'][0]
+    assert result['annotations'][0]['bbox'][0] is not source['annotations'][0]['bbox'][0]
+    assert result['annotations'][0]['iscrowd'] == 1
+    assert result['annotations'][0]['area'] == source['annotations'][0]['area']

@@ -160,8 +160,12 @@ def metric_annotations(path, expected_sha256, ids):
               'categories': source['categories'],
               'annotations': [{k: v for k, v in x.items() if k != 'segmentation'}
                               for x in source['annotations'] if x['image_id'] in wanted]}
-    del source  # the segmentation-heavy full source is not retained during training
     if {x['id'] for x in result['images']} != wanted: raise ValueError('metric GT IDs missing')
+    # Pack the small retained GT while the full JSON is still alive. Borrowed
+    # bbox floats otherwise pin segmentation-sized CPython allocator arenas,
+    # evicting the common feature cache despite deleting the source dictionary.
+    result = json.loads(json.dumps(result))
+    del source
     return result
 
 
