@@ -236,7 +236,7 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
         path.mkdir(exist_ok=True)
     (cache_dirs["YOLO_CONFIG_DIR"] / "Ultralytics").mkdir(exist_ok=True)
     child_env = {**os.environ, **(env or {}), "HEAD_SHARING_RESERVATION": token,
-                 "HEAD_SHARING_LAUNCH_GATE": str(gate_path),
+                 "HEAD_SHARING_LAUNCH_GATE": str(gate_path), "HEAD_SHARING_LEDGER": str(ledger.root),
                  "HEAD_SHARING_CPU_BUDGET": str(job["cpus"]),
                  "CUDA_VISIBLE_DEVICES": job["uuid"], "YOLO_OFFLINE": "true"}
     child_env.update({key: str(path) for key, path in cache_dirs.items()})

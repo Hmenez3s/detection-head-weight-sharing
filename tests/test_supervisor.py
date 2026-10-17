@@ -45,6 +45,21 @@ def test_progress_heartbeat_exit_and_only_owned_child_reaped(tmp_path):
         sentinel.terminate(); sentinel.wait(timeout=3)
 
 
+def test_child_environment_uses_owned_ledger_and_trusts_supervisor_identity(tmp_path):
+    ledger, token, cwd = setup(tmp_path)
+    forged = tmp_path / "foreign-ledger"
+    script = ("import os,pathlib; "
+              f"assert os.environ['HEAD_SHARING_LEDGER']=={str(ledger.root)!r}; "
+              f"assert os.environ['HEAD_SHARING_RESERVATION']=={token!r}; "
+              f"assert os.environ['CUDA_VISIBLE_DEVICES']=={GPU_UUIDS[0]!r}; "
+              "assert pathlib.Path(os.environ['HEAD_SHARING_LAUNCH_GATE']).is_file(); "
+              "pathlib.Path('progress').write_text('ok')")
+    assert launch(ledger, token, [sys.executable, "-c", script], cwd=cwd,
+                  log_path=cwd/"job.log", progress_path=cwd/"progress", first_progress_seconds=2,
+                  env={"HEAD_SHARING_LEDGER": str(forged), "CUDA_VISIBLE_DEVICES": "forged"}) == 0
+    assert ledger.get_job(token)["status"] == "complete"
+
+
 def test_stalled_child_is_reaped_and_failure_charged(tmp_path):
     ledger, token, cwd = setup(tmp_path)
     with pytest.raises(TimeoutError, match="first real progress"):
