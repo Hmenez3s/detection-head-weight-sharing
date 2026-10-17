@@ -196,6 +196,110 @@ def test_persistent_sharing_denial_is_bounded_and_keeps_previous_ledger(tmp_path
     assert not list(ledger.root.glob('.ledger-*'))
 
 
+def test_explicit_budget_extension_preserves_old_state_and_is_idempotent(tmp_path):
+    ledger = AllocationLedger(owned(tmp_path))
+    token = ledger.reserve(GPU_UUIDS[0], 46_800, phase="main", cpus=2)
+    ledger.update_job(token, status="failed")
+    before = ledger._load()
+    assert ledger.authorize_extension(reason="approved study", evidence="authorization-01")
+    after = ledger._load()
+    assert after["devices"] == before["devices"]
+    assert after["policy"]["total_seconds"] == 172_800
+    assert after["policy"]["main_seconds"] == 140_400
+    assert after["policy"]["final_seconds"] == 21_600
+    assert after["policy"]["contingency_seconds"] == 10_800
+    assert len(after["policy_history"]) == 1
+    assert not ledger.authorize_extension(reason="approved study", evidence="authorization-01")
+    assert len(ledger._load()["policy_history"]) == 1
+    assert ledger.get_job(token)["seconds"] == 46_800
+    first = ledger.reserve(GPU_UUIDS[0], 9, phase="main", cpus=2)
+    second = ledger.reserve(GPU_UUIDS[0], 9, phase="main", cpus=2)
+    with pytest.raises(RuntimeErrorSafe, match="maximum"):
+        ledger.reserve(GPU_UUIDS[0], 9, phase="main", cpus=2)
+    assert ledger.get_job(first)["seconds"] == ledger.get_job(second)["seconds"] == 9
+
+
+def test_extension_validation_and_concurrent_active_unknown_capacity(tmp_path):
+    ledger = AllocationLedger(owned(tmp_path))
+    with pytest.raises(RuntimeErrorSafe, match="required"):
+        ledger.authorize_extension(reason=" ", evidence="proof")
+    ledger.authorize_extension(reason="approved", evidence="receipt")
+    first = ledger.reserve(GPU_UUIDS[0], 140_400, phase="main", cpus=6)
+    second = ledger.reserve(GPU_UUIDS[0], 21_600, phase="final", cpus=6)
+    ledger.update_job(first, status="active-unknown")
+    ledger.update_job(second, status="failed")
+    with pytest.raises(RuntimeErrorSafe, match="phase balance"):
+        ledger.reserve(GPU_UUIDS[0], 9, phase="final", cpus=1)
+    with pytest.raises(RuntimeErrorSafe, match="aggregate CPU"):
+        ledger.reserve(GPU_UUIDS[1], 9, phase="main", cpus=7)
+    assert ledger.get_job(second)["status"] == "failed"
+
+
+def test_authorized_same_uuid_concurrent_reservations_admit_exactly_two(tmp_path):
+    ledger = AllocationLedger(owned(tmp_path))
+    ledger.authorize_extension(reason="approved", evidence="receipt")
+    outcomes = []
+    def reserve():
+        try:
+            outcomes.append(ledger.reserve(GPU_UUIDS[0], 9, phase="main", cpus=1))
+        except RuntimeErrorSafe:
+            outcomes.append("denied")
+    threads = [threading.Thread(target=reserve) for _ in range(8)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert sum(result != "denied" for result in outcomes) == 2
+    assert sum(result == "denied" for result in outcomes) == 6
+    state = ledger._load()
+    assert sum(job["seconds"] for job in state["devices"][GPU_UUIDS[0]]["jobs"]) == 18
+
+
+def test_headroom_guard_serializes_pending_peak_commitments_and_fails_closed(tmp_path):
+    ledger = AllocationLedger(owned(tmp_path))
+    ledger.authorize_extension(reason="approved", evidence="receipt")
+    first = ledger.reserve(GPU_UUIDS[0], 10, phase="main", cpus=1, peak_memory_bytes=200)
+    second = ledger.reserve(GPU_UUIDS[0], 10, phase="main", cpus=1, peak_memory_bytes=200)
+    sample = {"uuid": GPU_UUIDS[0], "free_bytes": 1_500, "total_bytes": 10_000,
+              "sampled_at": time.time()}
+    assert ledger.guard_headroom(first, sample, admission=True)["required_free_bytes"] == 1_400
+    with pytest.raises(RuntimeErrorSafe, match="headroom"):
+        ledger.guard_headroom(second, {**sample, "free_bytes": 1_300}, admission=True)
+    stale = {**sample, "sampled_at": time.time()-30}
+    with pytest.raises(RuntimeErrorSafe, match="stale"):
+        ledger.guard_headroom(first, stale, admission=False)
+    wrong = {**sample, "uuid": GPU_UUIDS[1]}
+    with pytest.raises(RuntimeErrorSafe, match="mismatch"):
+        ledger.guard_headroom(first, wrong, admission=False)
+    assert len(ledger.get_job(second)["headroom_receipts"]) == 1
+
+
+def test_headroom_receipts_are_bounded_but_summary_covers_every_sample(tmp_path):
+    ledger = AllocationLedger(owned(tmp_path))
+    ledger.authorize_extension(reason="approved", evidence="receipt")
+    token = ledger.reserve(GPU_UUIDS[0], 20, phase="main", cpus=1, peak_memory_bytes=50)
+    failure_time = None
+    for index in range(128):
+        free = 99 if index == 83 else 500
+        sampled_at = time.time()
+        if index == 83:
+            failure_time = sampled_at
+        sample = {"uuid": GPU_UUIDS[0], "free_bytes": free, "total_bytes": 1_000,
+                  "sampled_at": sampled_at}
+        try:
+            ledger.guard_headroom(token, sample, admission=(index == 0))
+        except RuntimeErrorSafe:
+            assert index == 83
+    job = ledger.get_job(token)
+    summary = job["headroom_summary"]
+    assert len(job["headroom_receipts"]) == 32
+    assert job["headroom_receipts"][0]["admission"] is True
+    assert any(not receipt["passed"] for receipt in job["headroom_receipts"])
+    assert summary["sample_count"] == 128
+    assert summary["min_free_fraction"] == 0.099
+    assert summary["min_free_fraction_sample"] == {
+        "free_bytes": 99, "total_bytes": 1_000, "sampled_at": failure_time}
+    assert summary["min_free_bytes"] == 99 and summary["min_total_bytes"] == 1_000
+
+
 def test_exclusive_lock_creation_retries_transient_access_denial(tmp_path, monkeypatch):
     import head_sharing.runtime as runtime
     ledger = AllocationLedger(owned(tmp_path))

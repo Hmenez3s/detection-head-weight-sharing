@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -188,10 +189,41 @@ def _terminate_owned(proc: subprocess.Popen, identity: str, *, grace: float = 2.
     except subprocess.TimeoutExpired: raise RuntimeErrorSafe("owned process did not reap")
 
 
+def physical_memory_metrics(device_uuid: str) -> dict:
+    """Query bounded nvidia-smi physical-memory data for one exact UUID."""
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=uuid,memory.free,memory.total",
+                                 "--format=csv,noheader,nounits"], check=True, timeout=1.0,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+        rows = [line.split(",") for line in result.stdout.splitlines() if line.strip()]
+        matches = [row for row in rows if len(row) == 3 and row[0].strip() == device_uuid]
+        if len(matches) != 1:
+            raise RuntimeErrorSafe("physical-memory query UUID missing or ambiguous")
+        free_mib, total_mib = int(matches[0][1].strip()), int(matches[0][2].strip())
+        return {"uuid": device_uuid, "free_bytes": free_mib * 1024 * 1024,
+                "total_bytes": total_mib * 1024 * 1024, "sampled_at": time.time()}
+    except RuntimeErrorSafe:
+        raise
+    except Exception as exc:
+        raise RuntimeErrorSafe("bounded physical-memory query failed") from exc
+
+
+def _launch_deadline(started: float, allocation_seconds: int, *, memory_guard: bool) -> float:
+    """Keep the legacy cleanup window, reserving one query second only when guarded."""
+    return started + allocation_seconds - CLEANUP_SAFETY_SECONDS - (1 if memory_guard else 0)
+
+
 def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str | Path,
            log_path: str | Path, progress_path: str | Path, first_progress_seconds: float = 300,
            heartbeat_seconds: float = 120, env: dict[str, str] | None = None,
-           popen_factory=subprocess.Popen) -> int:
+           popen_factory=subprocess.Popen, memory_guard: bool = False,
+           memory_metrics=physical_memory_metrics, memory_poll_seconds: float = 5.0) -> int:
+    if memory_guard and (isinstance(memory_poll_seconds, bool) or
+                         not isinstance(memory_poll_seconds, (int, float)) or
+                         not 0 < memory_poll_seconds <= 15 or
+                         not math.isfinite(memory_poll_seconds)):
+        raise RuntimeErrorSafe("memory polling interval must be finite and in (0, 15]")
     job = ledger.get_job(token)
     owner_root = ledger.root.parent
     requested_cwd = Path(cwd).absolute()
@@ -209,8 +241,17 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
     if (_has_symlink_component(log) or _has_symlink_component(progress) or log.exists() or progress.exists() or
             log.parent != requested_cwd or progress.parent != requested_cwd):
         raise RuntimeErrorSafe("logs/progress must be new files owned by the verified job cwd")
-    if job["seconds"] < MIN_ALLOCATION_SECONDS:
+    minimum_seconds = MIN_ALLOCATION_SECONDS + (1 if memory_guard else 0)
+    if job["seconds"] < minimum_seconds:
         raise RuntimeErrorSafe("allocation is too short for bounded cleanup safety allowance")
+    if memory_guard:
+        try:
+            ledger.guard_headroom(token, memory_metrics(job["uuid"]), admission=True)
+        except BaseException as exc:
+            ledger.update_job(token, status="failed", ended=time.time(),
+                              failure=f"headroom-admission:{type(exc).__name__}",
+                              headroom_failure=type(exc).__name__, headroom_pending_bytes=0)
+            raise
     gate_path = job_root / ".supervisor-ready"
     if gate_path.exists() or _has_symlink_component(gate_path):
         raise RuntimeErrorSafe("launch gate path is not new and owned")
@@ -264,12 +305,20 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
         ledger.update_job(token, pid=proc.pid, pid_identity=identity, started=started, status="running",
                           log=str(log), progress_file=str(progress), cwd=str(job_root))
         gate_path.touch(exist_ok=False)
-        deadline = started + job["seconds"] - CLEANUP_SAFETY_SECONDS
+        deadline = _launch_deadline(started, job["seconds"], memory_guard=memory_guard)
         last_progress_stamp = None
+        last_memory_check = started
         while proc.poll() is None:
             now = time.time()
             if now >= deadline:
                 raise TimeoutError("reserved allocation deadline exceeded")
+            if memory_guard and now - last_memory_check >= memory_poll_seconds:
+                try:
+                    ledger.guard_headroom(token, memory_metrics(job["uuid"]), admission=False)
+                except BaseException as exc:
+                    ledger.update_job(token, headroom_failure=type(exc).__name__)
+                    raise
+                last_memory_check = now
             if progress.exists():
                 stamp = progress.stat().st_mtime
                 if stamp > started:
@@ -319,6 +368,9 @@ def main(argv=None) -> int:
     parser.add_argument("--progress", required=True)
     parser.add_argument("--first-progress-seconds", type=float, default=300)
     parser.add_argument("--heartbeat-seconds", type=float, default=120)
+    parser.add_argument("--memory-guard", action="store_true",
+                        help="require exact-UUID physical-memory headroom before and during launch")
+    parser.add_argument("--memory-poll-seconds", type=float, default=5.0)
     parser.add_argument("command", nargs=argparse.REMAINDER, help="child command after --")
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command and args.command[0] == "--" else args.command
@@ -326,7 +378,8 @@ def main(argv=None) -> int:
         parser.error("provide child command after --")
     return launch(AllocationLedger(args.root), args.reservation, command, cwd=args.cwd,
                   log_path=args.log, progress_path=args.progress,
-                  first_progress_seconds=args.first_progress_seconds, heartbeat_seconds=args.heartbeat_seconds)
+                  first_progress_seconds=args.first_progress_seconds, heartbeat_seconds=args.heartbeat_seconds,
+                  memory_guard=args.memory_guard, memory_poll_seconds=args.memory_poll_seconds)
 
 if __name__ == "__main__":
     raise SystemExit(main())

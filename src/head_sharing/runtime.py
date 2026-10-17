@@ -17,7 +17,12 @@ GPU_UUIDS = (
 CAP_SECONDS = 57_600
 FINAL_SECONDS = 7_200
 CONTINGENCY_SECONDS = 3_600
+EXTENDED_CAP_SECONDS = 172_800
+EXTENDED_FINAL_SECONDS = 21_600
+EXTENDED_CONTINGENCY_SECONDS = 10_800
 MAX_CPUS = 12
+ACTIVE_STATUSES = {"reserved", "launching", "running", "active-unknown"}
+
 LEDGER_LOCK_WAIT_SECONDS = 2.0
 CLEANUP_SAFETY_SECONDS = 8
 MIN_ALLOCATION_SECONDS = CLEANUP_SAFETY_SECONDS + 1
@@ -144,9 +149,69 @@ class AllocationLedger:
             raise RuntimeErrorSafe("ledger unreadable; refusing allocation") from exc
         if state.get("version") != 1 or set(state.get("devices", {})) != set(GPU_UUIDS):
             raise RuntimeErrorSafe("ledger UUID/config mismatch")
+        policy = state.get("policy")
+        history = state.get("policy_history", [])
+        if policy is None:
+            if not isinstance(history, list) or history:
+                raise RuntimeErrorSafe("policy history exists without authorized policy")
+        else:
+            expected = {"total_seconds": EXTENDED_CAP_SECONDS, "main_seconds": 140_400,
+                        "final_seconds": EXTENDED_FINAL_SECONDS, "contingency_seconds": EXTENDED_CONTINGENCY_SECONDS,
+                        "max_active_jobs_per_uuid": 2}
+            record = history[-1] if isinstance(history, list) and history else None
+            authorization = record.get("authorization") if isinstance(record, dict) else None
+            if (policy != expected or not isinstance(record, dict) or record.get("after_caps") != policy or
+                    not isinstance(authorization, dict) or
+                    not isinstance(authorization.get("reason"), str) or not authorization["reason"].strip() or
+                    not isinstance(authorization.get("evidence"), str) or not authorization["evidence"].strip() or
+                    {key: authorization.get(key) for key in expected} != expected):
+                raise RuntimeErrorSafe("invalid or unauthorised ledger policy metadata")
         return state
 
-    def reserve(self, device_uuid: str, seconds: int, *, phase: str, cpus: int = 6, command: list[str] | None = None) -> str:
+    def authorize_extension(self, *, reason: str, evidence: str) -> bool:
+        """Explicitly enable the approved cumulative budget and two-job policy.
+
+        Returns False for an identical replay; prior charges, jobs, and history
+        are preserved under the same cooperative mutex as reservations.
+        """
+        if not isinstance(reason, str) or not reason.strip() or not isinstance(evidence, str) or not evidence.strip():
+            raise RuntimeErrorSafe("authorization reason and evidence are required")
+        authorization = {"reason": reason.strip(), "evidence": evidence.strip(),
+                         "total_seconds": EXTENDED_CAP_SECONDS,
+                         "main_seconds": EXTENDED_CAP_SECONDS-EXTENDED_FINAL_SECONDS-EXTENDED_CONTINGENCY_SECONDS,
+                         "final_seconds": EXTENDED_FINAL_SECONDS,
+                         "contingency_seconds": EXTENDED_CONTINGENCY_SECONDS,
+                         "max_active_jobs_per_uuid": 2}
+        with self._locked():
+            state = self._load()
+            history = state.get("policy_history", [])
+            if not isinstance(history, list):
+                raise RuntimeErrorSafe("invalid policy history")
+            for entry in history:
+                if not isinstance(entry, dict) or not isinstance(entry.get("authorization"), dict):
+                    raise RuntimeErrorSafe("invalid policy history")
+            if state.get("policy") is not None:
+                policy = state["policy"]
+                if policy != {key: value for key, value in authorization.items() if key not in ("reason", "evidence")}:
+                    raise RuntimeErrorSafe("unsupported or malformed ledger policy")
+                if history and history[-1].get("authorization") == authorization:
+                    return False
+                # An already enabled policy cannot be replaced or re-authorized.
+                raise RuntimeErrorSafe("policy is already authorized; refusing policy mutation")
+            before = {u: {k: state["devices"][u][k] for k in ("main", "final", "contingency")} for u in GPU_UUIDS}
+            before_caps = {"total_seconds": CAP_SECONDS, "main_seconds": CAP_SECONDS-FINAL_SECONDS-CONTINGENCY_SECONDS,
+                           "final_seconds": FINAL_SECONDS, "contingency_seconds": CONTINGENCY_SECONDS,
+                           "max_active_jobs_per_uuid": 1}
+            after_caps = {key: value for key, value in authorization.items() if key not in ("reason", "evidence")}
+            state["policy"] = after_caps
+            state.setdefault("policy_history", []).append({"authorization": authorization,
+                "before_caps": before_caps, "after_caps": after_caps, "before_balances": before,
+                "after_balances": {u: dict(before[u]) for u in GPU_UUIDS}, "created": self.clock()})
+            _atomic_json(self.root / "ledger.json", state)
+            return True
+
+    def reserve(self, device_uuid: str, seconds: int, *, phase: str, cpus: int = 6, command: list[str] | None = None,
+                peak_memory_bytes: int | None = None) -> str:
         if device_uuid not in GPU_UUIDS or phase not in ("main", "final", "contingency"):
             raise RuntimeErrorSafe("unknown UUID or allocation phase")
         if type(seconds) is not int or seconds < MIN_ALLOCATION_SECONDS or type(cpus) is not int or cpus <= 0 or cpus > 12:
@@ -154,19 +219,110 @@ class AllocationLedger:
         with self._locked():
             state = self._load()
             device = state["devices"][device_uuid]
-            active = {"reserved", "launching", "running", "active-unknown"}
-            if any(j["status"] in active for j in device["jobs"]):
-                raise RuntimeErrorSafe("physical UUID already has a reserved job")
+            active = ACTIVE_STATUSES
+            policy = state.get("policy")
+            max_slots = 1
             limits = {"main": CAP_SECONDS-FINAL_SECONDS-CONTINGENCY_SECONDS, "final": FINAL_SECONDS, "contingency": CONTINGENCY_SECONDS}
+            if policy is not None:
+                expected = {"total_seconds": EXTENDED_CAP_SECONDS, "main_seconds": 140_400,
+                            "final_seconds": EXTENDED_FINAL_SECONDS, "contingency_seconds": EXTENDED_CONTINGENCY_SECONDS,
+                            "max_active_jobs_per_uuid": 2}
+                if policy != expected:
+                    raise RuntimeErrorSafe("unsupported or malformed ledger policy")
+                limits = {"main": policy["main_seconds"], "final": policy["final_seconds"],
+                          "contingency": policy["contingency_seconds"]}
+                max_slots = policy["max_active_jobs_per_uuid"]
+            if peak_memory_bytes is not None and (type(peak_memory_bytes) is not int or peak_memory_bytes <= 0):
+                raise RuntimeErrorSafe("peak memory commitment must be a positive integer")
+            if sum(j["status"] in active for j in device["jobs"]) >= max_slots:
+                raise RuntimeErrorSafe("physical UUID already has the maximum reserved jobs")
             if device[phase] + seconds > limits[phase]:
                 raise RuntimeErrorSafe("allocation exceeds phase balance")
             if sum(cpus for d in state["devices"].values() for j in d["jobs"] if j["status"] in {"reserved", "launching", "running", "active-unknown"} for cpus in [j["cpus"]]) + cpus > MAX_CPUS:
                 raise RuntimeErrorSafe("aggregate CPU allocation exceeds 12")
             token = str(uuid.uuid4())
             device[phase] += seconds
-            device["jobs"].append({"id": token, "uuid": device_uuid, "phase": phase, "seconds": seconds, "cpus": cpus, "command": command or [], "created": self.clock(), "pid": None, "pid_identity": None, "started": None, "ended": None, "exit_code": None, "progress": None, "status": "reserved"})
+            job = {"id": token, "uuid": device_uuid, "phase": phase, "seconds": seconds, "cpus": cpus,
+                   "command": command or [], "created": self.clock(), "pid": None, "pid_identity": None,
+                   "started": None, "ended": None, "exit_code": None, "progress": None, "status": "reserved"}
+            if peak_memory_bytes is not None:
+                job.update(peak_memory_bytes=peak_memory_bytes, headroom_pending_bytes=peak_memory_bytes)
+            device["jobs"].append(job)
             _atomic_json(self.root / "ledger.json", state)
             return token
+
+    def guard_headroom(self, token: str, sample: dict, *, admission: bool) -> dict:
+        """Validate and record mocked/injected physical-memory evidence under lock."""
+        with self._locked():
+            state = self._load()
+            if state.get("policy") is None:
+                raise RuntimeErrorSafe("headroom guard requires explicit authorized policy")
+            found = None
+            device = None
+            for candidate in state["devices"].values():
+                for job in candidate["jobs"]:
+                    if job["id"] == token:
+                        found, device = job, candidate
+                        break
+            if found is None or found["status"] not in ACTIVE_STATUSES:
+                raise RuntimeErrorSafe("headroom guard requires an active reservation")
+            if not isinstance(sample, dict) or sample.get("uuid") != found["uuid"]:
+                raise RuntimeErrorSafe("physical-memory UUID mismatch")
+            free, total, sampled_at = sample.get("free_bytes"), sample.get("total_bytes"), sample.get("sampled_at")
+            if (type(free) is not int or type(total) is not int or free < 0 or total <= 0 or free > total or
+                    type(sampled_at) not in (int, float) or not (0 <= self.clock() - sampled_at <= 15)):
+                raise RuntimeErrorSafe("physical-memory sample is malformed or stale")
+            if admission:
+                peak = found.get("peak_memory_bytes")
+                if type(peak) is not int or peak <= 0:
+                    raise RuntimeErrorSafe("guarded launch requires a declared positive peak memory commitment")
+                pending = sum(j.get("headroom_pending_bytes") or 0 for j in device["jobs"]
+                              if j is not found and j["status"] in ACTIVE_STATUSES)
+                required = (total + 9) // 10 + pending + peak
+            else:
+                required = (total + 9) // 10
+            receipt = {"uuid": found["uuid"], "free_bytes": free, "total_bytes": total,
+                       "sampled_at": sampled_at, "required_free_bytes": required,
+                       "admission": bool(admission), "passed": free >= required}
+            summary = found.setdefault("headroom_summary", {
+                "sample_count": 0, "min_free_fraction": None, "min_free_bytes": None,
+                "min_total_bytes": None, "min_free_fraction_sample": None,
+                "min_free_bytes_sampled_at": None, "min_total_bytes_sampled_at": None,
+                "first_sampled_at": sampled_at, "last_sampled_at": sampled_at})
+            summary["sample_count"] += 1
+            summary["last_sampled_at"] = sampled_at
+            fraction = free / total
+            if summary["min_free_fraction"] is None or fraction < summary["min_free_fraction"]:
+                summary["min_free_fraction"] = fraction
+                summary["min_free_fraction_sample"] = {"free_bytes": free, "total_bytes": total,
+                                                        "sampled_at": sampled_at}
+            if summary["min_free_bytes"] is None or free < summary["min_free_bytes"]:
+                summary["min_free_bytes"] = free
+                summary["min_free_bytes_sampled_at"] = sampled_at
+            if summary["min_total_bytes"] is None or total < summary["min_total_bytes"]:
+                summary["min_total_bytes"] = total
+                summary["min_total_bytes_sampled_at"] = sampled_at
+            receipts = found.setdefault("headroom_receipts", [])
+            receipts.append(receipt)
+            if len(receipts) > 32:
+                indexed = list(enumerate(receipts))
+                admission_indexes = [i for i, entry in indexed if entry.get("admission")]
+                failed_indexes = [i for i, entry in indexed if not entry.get("passed")]
+                keep = set(admission_indexes[:1])
+                for index in reversed(failed_indexes):
+                    if len(keep) == 32:
+                        break
+                    keep.add(index)
+                for index in range(len(receipts)-1, -1, -1):
+                    if len(keep) == 32:
+                        break
+                    keep.add(index)
+                found["headroom_receipts"] = [entry for i, entry in indexed if i in keep]
+            if not receipt["passed"]:
+                _atomic_json(self.root / "ledger.json", state)
+                raise RuntimeErrorSafe("physical-memory headroom below required margin")
+            _atomic_json(self.root / "ledger.json", state)
+            return receipt
 
     def validate_device(self, token: str, actual_uuid: str, *, cuda_module=None):
         """Validate the exact reserved physical UUID from a guarded child."""
@@ -224,20 +380,31 @@ def main(argv=None) -> int:
     reserve.add_argument("--root", required=True); reserve.add_argument("--uuid", required=True)
     reserve.add_argument("--seconds", type=int, required=True); reserve.add_argument("--phase", choices=("main", "final", "contingency"), required=True)
     reserve.add_argument("--cpus", type=int, default=6)
+    reserve.add_argument("--peak-memory-bytes", type=int)
+    extend = sub.add_parser("authorize-extension", help="append explicit cumulative-budget authorization")
+    extend.add_argument("--root", required=True); extend.add_argument("--reason", required=True); extend.add_argument("--evidence", required=True)
     args = parser.parse_args(argv)
     if args.action == "init":
         initialize(args.owned_study_root, args.subroot); return 0
     ledger = AllocationLedger(args.root)
+    if args.action == "authorize-extension":
+        print("authorized" if ledger.authorize_extension(reason=args.reason, evidence=args.evidence) else "already-authorized")
+        return 0
     if args.action == "status":
         with ledger._locked():
             state = ledger._load()
         public = {device_uuid: {"main": device["main"], "final": device["final"],
                                 "contingency": device["contingency"],
+                                "effective_policy": state.get("policy", {"total_seconds": CAP_SECONDS,
+                                    "main_seconds": CAP_SECONDS-FINAL_SECONDS-CONTINGENCY_SECONDS,
+                                    "final_seconds": FINAL_SECONDS, "contingency_seconds": CONTINGENCY_SECONDS,
+                                    "max_active_jobs_per_uuid": 1}),
                                 "jobs": [{key: job.get(key) for key in ("id", "phase", "seconds", "cpus", "status", "pid", "started", "ended", "exit_code", "progress")}
                                          for job in device["jobs"]]}
                   for device_uuid, device in state["devices"].items()}
         print(json.dumps(public, sort_keys=True)); return 0
-    print(ledger.reserve(args.uuid, args.seconds, phase=args.phase, cpus=args.cpus)); return 0
+    print(ledger.reserve(args.uuid, args.seconds, phase=args.phase, cpus=args.cpus,
+                         peak_memory_bytes=args.peak_memory_bytes)); return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

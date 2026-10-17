@@ -7,7 +7,7 @@ import time
 import pytest
 
 from head_sharing.runtime import AllocationLedger, GPU_UUIDS, initialize
-from head_sharing.supervisor import child_entry, launch, windows_detached_flags
+from head_sharing.supervisor import _launch_deadline, child_entry, launch, windows_detached_flags
 
 
 def setup(tmp_path):
@@ -40,6 +40,70 @@ def test_progress_heartbeat_exit_and_only_owned_child_reaped(tmp_path):
         job = ledger.get_job(token)
         assert job["status"] == "complete" and job["pid"] and job["started"] and job["ended"]
         assert job["actual_wall_elapsed_seconds"] >= 0 and job["seconds"] == 20
+        assert sentinel.poll() is None
+    finally:
+        sentinel.terminate(); sentinel.wait(timeout=3)
+
+
+@pytest.mark.parametrize("poll", [float("nan"), float("inf"), -float("inf"), True, "1"])
+def test_invalid_guard_polling_is_rejected_before_metrics_or_child_launch(tmp_path, poll):
+    ledger, token, cwd = setup(tmp_path)
+    metric_calls = []
+    child_calls = []
+    with pytest.raises(Exception, match="finite"):
+        launch(ledger, token, [sys.executable, "-c", "open('started','w').write('yes')"],
+               cwd=cwd, log_path=cwd/"job.log", progress_path=cwd/"progress",
+               memory_guard=True, memory_poll_seconds=poll,
+               memory_metrics=lambda _uuid: metric_calls.append(_uuid),
+               popen_factory=lambda *args, **kwargs: child_calls.append(args))
+    assert metric_calls == child_calls == []
+    assert list(cwd.iterdir()) == []
+
+
+def test_guard_query_cost_is_reserved_without_changing_legacy_deadline():
+    started = 100.0
+    legacy = _launch_deadline(started, 20, memory_guard=False)
+    guarded = _launch_deadline(started, 20, memory_guard=True)
+    assert legacy == 112.0 and guarded == 111.0
+    assert legacy - guarded == 1.0
+
+
+def test_guarded_launch_records_mocked_admission_and_runs_child(tmp_path):
+    ledger, token, cwd = setup(tmp_path)
+    ledger.authorize_extension(reason="approved", evidence="receipt")
+    ledger.update_job(token, peak_memory_bytes=100, headroom_pending_bytes=100)
+    samples = []
+    def metrics(device_uuid):
+        samples.append(device_uuid)
+        return {"uuid": device_uuid, "free_bytes": 900, "total_bytes": 1_000,
+                "sampled_at": time.time()}
+    code = launch(ledger, token, [sys.executable, "-c", "open('progress','w').write('ok')"],
+                  cwd=cwd, log_path=cwd/"job.log", progress_path=cwd/"progress",
+                  first_progress_seconds=2, memory_guard=True, memory_metrics=metrics)
+    assert code == 0 and samples == [GPU_UUIDS[0]]
+    job = ledger.get_job(token)
+    assert job["status"] == "complete"
+    assert job["headroom_receipts"][0]["admission"] is True
+    assert job["headroom_receipts"][0]["required_free_bytes"] == 200
+
+
+def test_guarded_low_headroom_reaps_only_owned_child_and_keeps_charge(tmp_path):
+    ledger, token, cwd = setup(tmp_path)
+    ledger.authorize_extension(reason="approved", evidence="receipt")
+    ledger.update_job(token, peak_memory_bytes=100, headroom_pending_bytes=100)
+    sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    samples = iter([
+        {"uuid": GPU_UUIDS[0], "free_bytes": 900, "total_bytes": 1_000, "sampled_at": time.time()},
+        {"uuid": GPU_UUIDS[0], "free_bytes": 50, "total_bytes": 1_000, "sampled_at": time.time()},
+    ])
+    try:
+        with pytest.raises(Exception, match="headroom"):
+            launch(ledger, token, [sys.executable, "-c", "import time; time.sleep(10)"],
+                   cwd=cwd, log_path=cwd/"job.log", progress_path=cwd/"progress",
+                   memory_guard=True, memory_metrics=lambda _uuid: next(samples), memory_poll_seconds=.01)
+        job = ledger.get_job(token)
+        assert job["status"] == "failed" and job["seconds"] == 20
+        assert len(job["headroom_receipts"]) == 2
         assert sentinel.poll() is None
     finally:
         sentinel.terminate(); sentinel.wait(timeout=3)
