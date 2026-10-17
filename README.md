@@ -11,7 +11,7 @@
 ## The idea
 
 - **Today**, each scale has its own head: P for small objects, M for medium, G for large. What the P head learns never reaches M or G.
-- **Proposed**, each scale passes through a small 1×1 adapter to 80 channels. It then goes through **the same two blocks, applied four times** with a residual update `h ← h + 0.1·F(h)`, and **the same box and class outputs**.
+- **Proposed**, box and class keep separate towers, as in the original, but **each tower is shared by all three scales and looped**. A small per-scale adapter brings each scale to the tower's width. Then **the same two blocks run three times** with a residual update `h ← h + 0.1·F(h)`, followed by the same output layer.
 - **The goal is generalization across scales and higher accuracy, not fewer parameters.** The head does about twice the original's convolution work; the full detector does about 20% more. Latency is measured as well, because every pass moves the feature maps through memory again, even when the weights are reused.
 
 ## Planned design
@@ -19,13 +19,18 @@
 | | Original | Proposed |
 |---|---|---|
 | Heads | 3, one per scale | 1, shared by P, M and G |
-| Width | box 16 · class 80 | 80, shared by box and class |
-| Depth | 2 blocks | adapter + 8 blocks (4 passes of A, B) |
-| Sets of weights | 12 blocks | 2 shared blocks + 3 adapters |
+| Towers | separate box and class | separate box and class |
+| Width | box 16 · class 80 | box 16 · class 80 |
+| Depth | 2 blocks | adapter + 6 blocks (3 passes of 2) |
+| Sets of weights | 12 blocks | 4 shared blocks + 6 adapters |
 | Normalization | BatchNorm | GroupNorm: no running statistics mixed across passes or scales |
-| Head compute | 385 M MACs (measured) | ≈758 M MACs (estimate) |
+| Head compute | 385 M MACs (measured) | ≈782 M MACs (estimate) |
 
 A learned output scale per level, as in FCOS, lets the shared outputs adjust to each scale.
+
+**Why box and class stay separate.** Locating an object and naming it can pull a shared layer in different directions. [YOLOX](https://arxiv.org/abs/2107.08430) found that separating them speeds up training and improves AP; in an end-to-end YOLO, like YOLO26n, a shared box-and-class head lost 4.2 AP versus 0.8 for separate ones. Merging them here would also blur what the experiment measures.
+
+**What the adapter does.** P, M and G arrive with 64, 128 and 256 channels, but a shared tower needs one input width. The adapter compresses each scale to that width, for example 256 → 80 channels for G. The original's first layer already performs the same compression. A separable 3×3 adapter looks at neighboring locations before compressing, as the original class tower does, for about 2% more head compute.
 
 ## Planned comparison
 
@@ -40,7 +45,7 @@ A learned output scale per level, as in FCOS, lets the shared outputs adjust to 
 
 All arms use the same frozen YOLO26n trunk and training recipe, five paired seeds, checkpoint selection on a development split, and final evaluation on COCO val2017. AP, latency and memory are reported for every arm.
 
-**Still open before training:** the number of passes and the width, and whether box and class share one loop or keep separate looped towers.
+**Still open before training:** the number of passes and the tower widths.
 
 ## Repository
 
