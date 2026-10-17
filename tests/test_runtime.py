@@ -236,6 +236,24 @@ def test_extension_validation_and_concurrent_active_unknown_capacity(tmp_path):
     assert ledger.get_job(second)["status"] == "failed"
 
 
+def test_only_budget_data_is_fsynced_not_ephemeral_lock_metadata(tmp_path, monkeypatch):
+    import head_sharing.runtime as runtime
+    ledger = AllocationLedger(owned(tmp_path))
+    original = runtime.os.fsync
+    flushed = []
+
+    def observed(fd):
+        flushed.append(fd)
+        return original(fd)
+
+    monkeypatch.setattr(runtime.os, 'fsync', observed)
+    with ledger._locked():
+        ledger._load()
+    assert flushed == []
+    ledger.reserve(GPU_UUIDS[0], 9, phase='main', cpus=1)
+    assert len(flushed) == 1  # the atomic durable budget record, not its mutex
+
+
 def test_shared_instance_threads_queue_without_racing_file_lock(tmp_path, monkeypatch):
     ledger = AllocationLedger(owned(tmp_path))
     real_open = os.open

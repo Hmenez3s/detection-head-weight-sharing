@@ -140,8 +140,10 @@ class AllocationLedger:
                     time.sleep(min(0.05, max(0.005, deadline - time.monotonic())))
             try:
                 try:
+                    # This file is an ephemeral mutex, not a durable budget
+                    # record. Flushing it made every READ wait a disk rotation;
+                    # durable allocation writes still use _atomic_json/fsync.
                     os.write(fd, json.dumps({"pid": os.getpid(), "created": self.clock()}).encode())
-                    os.fsync(fd)
                 finally:
                     os.close(fd)
                 yield

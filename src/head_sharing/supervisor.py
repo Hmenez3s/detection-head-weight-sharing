@@ -14,6 +14,10 @@ import time
 from .runtime import (AllocationLedger, CLEANUP_SAFETY_SECONDS,
                      MIN_ALLOCATION_SECONDS, RuntimeErrorSafe, _has_symlink_component)
 
+# Fine-grained progress lives in the job's append-only file; the durable
+# allocation ledger only needs a periodic snapshot plus terminal status.
+LEDGER_PROGRESS_INTERVAL_SECONDS = 5.0
+
 
 def windows_detached_flags() -> int:
     """Exact flags proven to survive the SSH job boundary on supported Windows."""
@@ -307,6 +311,7 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
         gate_path.touch(exist_ok=False)
         deadline = _launch_deadline(started, job["seconds"], memory_guard=memory_guard)
         last_progress_stamp = None
+        last_progress_commit = None
         last_memory_check = started
         while proc.poll() is None:
             now = time.time()
@@ -323,8 +328,10 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
                 stamp = progress.stat().st_mtime
                 if stamp > started:
                     if stamp != last_progress_stamp:
-                        ledger.update_job(token, progress=stamp)
                         last_progress_stamp = stamp
+                        if last_progress_commit is None or now-last_progress_commit >= LEDGER_PROGRESS_INTERVAL_SECONDS:
+                            ledger.update_job(token, progress=stamp)
+                            last_progress_commit = now
                     if now - stamp > heartbeat_seconds:
                         raise TimeoutError("progress heartbeat stalled")
                 elif now - started > first_progress_seconds:
@@ -336,7 +343,10 @@ def launch(ledger: AllocationLedger, token: str, command: list[str], *, cwd: str
         _terminate_owned(proc, identity, windows_job=windows_job)
         tree_stopped = True
         ended = time.time()
+        if progress.exists() and progress.stat().st_mtime > started:
+            last_progress_stamp = progress.stat().st_mtime
         ledger.update_job(token, ended=ended, actual_wall_elapsed_seconds=ended-started,
+                          progress=last_progress_stamp,
                           exit_code=code, status="complete" if code == 0 else "failed")
         return code
     except BaseException as exc:

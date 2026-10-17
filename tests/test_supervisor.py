@@ -68,6 +68,27 @@ def test_guard_query_cost_is_reserved_without_changing_legacy_deadline():
     assert legacy - guarded == 1.0
 
 
+def test_frequent_progress_keeps_watchdog_live_without_fsyncing_each_poll(tmp_path, monkeypatch):
+    ledger, token, cwd = setup(tmp_path)
+    original = ledger.update_job
+    persisted = []
+
+    def observed(token, **updates):
+        if updates.get('progress') is not None:
+            persisted.append(updates['progress'])
+        return original(token, **updates)
+
+    monkeypatch.setattr(ledger, 'update_job', observed)
+    child = "import pathlib,time\np=pathlib.Path('progress')\nfor n in range(20):\n p.write_text(str(n)); time.sleep(.05)\n"
+    assert launch(ledger, token, [sys.executable, '-c', child], cwd=cwd,
+                  log_path=cwd/'job.log', progress_path=cwd/'progress',
+                  first_progress_seconds=2, heartbeat_seconds=2) == 0
+    record = ledger.get_job(token)
+    assert record['status'] == 'complete'
+    assert 1 <= len(persisted) <= 2  # first snapshot + terminal; no five-second boundary
+    assert record['progress'] == (cwd/'progress').stat().st_mtime
+
+
 def test_guarded_launch_records_mocked_admission_and_runs_child(tmp_path):
     ledger, token, cwd = setup(tmp_path)
     ledger.authorize_extension(reason="approved", evidence="receipt")
