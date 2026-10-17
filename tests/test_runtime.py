@@ -196,6 +196,42 @@ def test_persistent_sharing_denial_is_bounded_and_keeps_previous_ledger(tmp_path
     assert not list(ledger.root.glob('.ledger-*'))
 
 
+def test_exclusive_lock_creation_retries_transient_access_denial(tmp_path, monkeypatch):
+    import head_sharing.runtime as runtime
+    ledger = AllocationLedger(owned(tmp_path))
+    real_open = runtime.os.open
+    calls = []
+    def temporarily_pending(path, flags, *args, **kwargs):
+        if os.fspath(path) == os.fspath(ledger.root / 'ledger.lock'):
+            calls.append(path)
+            if len(calls) <= 2:
+                raise PermissionError(13, 'exclusive create temporarily denied')
+        return real_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(runtime.os, 'open', temporarily_pending)
+    token = ledger.reserve(GPU_UUIDS[1], 10, phase='main', cpus=1)
+    assert len(calls) == 3
+    assert ledger.get_job(token)['seconds'] == 10
+    assert ledger._load()['devices'][GPU_UUIDS[1]]['main'] == 10
+    assert not (ledger.root / 'ledger.lock').exists()
+
+
+def test_persistent_exclusive_lock_denial_is_bounded_and_preserves_ledger(tmp_path, monkeypatch):
+    import head_sharing.runtime as runtime
+    ledger = AllocationLedger(owned(tmp_path))
+    before = (ledger.root / 'ledger.json').read_bytes()
+    real_open = runtime.os.open
+    def inaccessible(path, flags, *args, **kwargs):
+        if os.fspath(path) == os.fspath(ledger.root / 'ledger.lock'):
+            raise PermissionError(13, 'persistent access denial')
+        return real_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(runtime.os, 'open', inaccessible)
+    monkeypatch.setattr(runtime, 'LEDGER_LOCK_WAIT_SECONDS', .02)
+    with pytest.raises(RuntimeErrorSafe, match='lock'):
+        ledger.reserve(GPU_UUIDS[1], 10, phase='main', cpus=1)
+    assert (ledger.root / 'ledger.json').read_bytes() == before
+    assert not (ledger.root / 'ledger.lock').exists()
+
+
 def test_job_reader_waits_for_cooperating_writer(tmp_path):
     ledger = AllocationLedger(owned(tmp_path))
     token = ledger.reserve(GPU_UUIDS[0], 10, phase='main', cpus=1)

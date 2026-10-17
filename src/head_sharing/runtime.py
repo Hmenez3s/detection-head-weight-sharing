@@ -120,9 +120,11 @@ class AllocationLedger:
             try:
                 fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 break
-            except FileExistsError as exc:
+            except (FileExistsError, PermissionError) as exc:
+                # Windows can deny exclusive creation while a deleted lock is
+                # still open. Wait, never remove it or bypass the mutex.
                 if time.monotonic() >= deadline:
-                    raise RuntimeErrorSafe("ledger lock persists; unknown/stale owner requires operator review") from exc
+                    raise RuntimeErrorSafe("ledger lock persists or is inaccessible; operator review required") from exc
                 time.sleep(min(0.05, max(0.005, deadline - time.monotonic())))
         try:
             os.write(fd, json.dumps({"pid": os.getpid(), "created": self.clock()}).encode())
