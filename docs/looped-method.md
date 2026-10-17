@@ -34,6 +34,24 @@ priors. The trunk, quantization boundary, optimizer, losses, data order,
 caches, selection and evaluation geometry remain unchanged. Reused AP is not
 an independent untouched confirmation benchmark.
 
+## Cache I/O and execution-source provenance
+
+Batch reads use buffered, contiguous reads into owned FP16 arrays before the
+unchanged FP16-to-FP32 conversion. Read-only whole-file maps remain available
+for explicit diagnostics, but batch iteration does not touch their payloads.
+This prevents training from keeping the entire two-view cache resident in each
+process working set; it does not change the cache bytes, image order, block
+flips, targets, quantization boundary or model arithmetic.
+
+The first two new fits completed all 40 epochs with source `a09b8e4`; subsequent
+fits use the bounded reader introduced in `91209cf`. Neither initial fit was
+interrupted for this change. CPU checks establish exact feature, native-loss,
+gradient and SGD-update equivalence for both loop arms. A separate disposable
+Windows observation confirms reduced mapped residency; it is not an accuracy
+or training-throughput benchmark. Execution-source commits are recorded per fit
+rather than attributing every fit to the final evaluator commit. The frozen
+scientific recipe and cumulative resource limits remain unchanged.
+
 ## Freeze serialization and validation
 
 Legacy freeze schema version 1 remains unchanged. Its top-level fields are
