@@ -111,21 +111,21 @@ def cache_batches(reader, *, seed: int, ids: list[int], batch_size: int):
     from .cache import read_blocks
     from .data import epoch_batches
     layout=reader.metadata["fixed_layout"]
+    if batch_size < 1: raise ValueError("batch_size must be positive")
     if list(ids) != reader.metadata["cohort_ids"].get("few") or layout.get("ids") != reader.metadata["block_order"].get("few"):
         raise ValueError("training IDs must exactly match the bound few cohort and layout")
     def batches(epoch):
         for group, flipped in epoch_batches(layout, seed, epoch):
             # Layout groups are fixed physical cache blocks; only their epoch order changes.
-            rows=list(read_blocks(reader,reader.metadata["cohort"],group,flipped=flipped,batch_size=batch_size))[0]
-            features, metadata=rows
-            selected=[]
-            for image_index, row in enumerate(metadata):
-                target_key="targets_xywhn" if not flipped else "flipped"
-                target=row[target_key] if not flipped else row[target_key]["targets_xywhn"]
-                selected.extend([[image_index,*t] for t in target])
-            targets=torch.tensor(selected,dtype=torch.float32).reshape(-1,6)
-            yield features,{"batch_idx":targets[:,0],"cls":targets[:,1:2],"bboxes":targets[:,2:]}
-    batches.steps=len(layout["blocks"]); return batches
+            for features, metadata in read_blocks(reader,reader.metadata["cohort"],group,flipped=flipped,batch_size=batch_size):
+                selected=[]
+                for image_index, row in enumerate(metadata):
+                    target_key="targets_xywhn" if not flipped else "flipped"
+                    target=row[target_key] if not flipped else row[target_key]["targets_xywhn"]
+                    selected.extend([[image_index,*t] for t in target])
+                targets=torch.tensor(selected,dtype=torch.float32).reshape(-1,6)
+                yield features,{"batch_idx":targets[:,0],"cls":targets[:,1:2],"bboxes":targets[:,2:]}
+    batches.steps=sum((len(group)+batch_size-1)//batch_size for group in layout["blocks"]); return batches
 
 
 def save_training_state(path, result, *, epoch, **bindings):

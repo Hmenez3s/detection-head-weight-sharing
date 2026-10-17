@@ -16,7 +16,34 @@ def test_cache_targets_use_image_row_indices_for_multiple_objects(monkeypatch):
     batches=cache_batches(Reader(),seed=11,ids=[10,20],batch_size=2)
     _,targets=next(batches(0))
     assert targets["batch_idx"].tolist()==[0.,0.,1.,1.]
+    assert batches.steps == 1
     with __import__("pytest").raises(ValueError): cache_batches(Reader(),seed=11,ids=[10],batch_size=2)
+
+
+def test_cache_smaller_batches_keep_all_images_and_one_block_flip(monkeypatch):
+    import torch
+    from head_sharing.train import cache_batches
+    rows = [{"targets_xywhn": [[i,.1,.2,.3,.4]],
+             "flipped": {"targets_xywhn": [[i,.9,.2,.3,.4]]}} for i in range(2)]
+    class Reader:
+        metadata={"fixed_layout":{"ids":[10,20],"blocks":[[10,20]]},"block_order":{"few":[10,20]},"cohort_ids":{"few":[10,20]},"cohort":"few"}
+    monkeypatch.setattr('head_sharing.data.epoch_batches', lambda layout,seed,epoch: iter([([10,20],True)]))
+    calls = []
+    def read(reader, cohort, group, *, flipped, batch_size):
+        calls.append((group,flipped,batch_size))
+        for i,row in enumerate(rows):
+            yield [torch.full((1,1,1,1),float(i))]*3,[row]
+    monkeypatch.setattr('head_sharing.cache.read_blocks',read)
+    batches = cache_batches(Reader(),seed=11,ids=[10,20],batch_size=1)
+    got = list(batches(0))
+    assert batches.steps == len(got) == 2
+    assert calls == [([10,20],True,1)]
+    assert [features[0].item() for features,_ in got] == [0.,1.]
+    assert [target['cls'].item() for _,target in got] == [0.,1.]
+    assert all(target['batch_idx'].tolist() == [0.] for _,target in got)
+    assert all(target['bboxes'][0,0].item() == __import__('pytest').approx(.9) for _,target in got)
+    with __import__('pytest').raises(ValueError,match='positive'):
+        cache_batches(Reader(),seed=11,ids=[10,20],batch_size=0)
 
 
 def test_train_cli_help_does_not_import_native_runtime():
