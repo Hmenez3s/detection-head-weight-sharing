@@ -5,6 +5,12 @@ from pathlib import Path
 
 SEEDS=[11,22,33,44,55]
 ARMS=["native","independent_k2","shared_k2"]
+from . import LOOPED_ARMS
+LOOPED_MATRIX=["native", *LOOPED_ARMS]
+OLD_RECIPE_SHA256="3db46e027e40eefde310b3dc35e5c0318e2613993f153ff7dfcd8533e37c9ff0"
+OLD_PROTOCOL_FILE_SHA256="ffdff515abf7d92d6ffb7019764ffb7297b6bdb89519065c4b5c186929801955"
+OLD_FREEZE_SHA256="70d7deb42d9e23d9efa6a3215f4e06841a3c336af860d208acb17d2152d359b3"
+LOOPED_ARCHITECTURE={"loop_ab2":{"box_width":24,"class_width":96,"updates":2},"loop_a3":{"box_width":28,"class_width":108,"updates":3},"adapter":"depthwise_3x3_pointwise_1x1","normalization":"per_point_channel_layernorm","activation":"silu","alpha":0.1,"scale_ids":"learned_per_scale_channel_vector","readout_priors":"native_per_scale_bias"}
 SELECTION={"cohort":"dev","metric":"AP50:95","tie":"earliest","training_length":"fixed_epochs"}
 NUMERIC_POLICY={"trunk_dtype":"float32","feature_storage_dtype":"float16","head_input_dtype":"float32","head_train_autocast":"bfloat16","metric_head_dtype":"float32","NVIDIA_TF32_OVERRIDE":"0","CUBLAS_WORKSPACE_CONFIG":":4096:8","cuda_matmul_allow_tf32":False,"cudnn_allow_tf32":True,"cudnn_benchmark":False,"cudnn_deterministic":False,"deterministic_algorithms":False}
 REQUIRED_RECIPE={"status","seed_list","arms","imgsz","batch_size","epochs","cadence","block_size","probe_size","optimizer","gains","quantization","producer","environment","trunk_sha256","split_sha256","cache_evidence","pilot_evidence","synthetic","gpu_for_seed","selection","numeric_policy"}
@@ -20,7 +26,8 @@ def digest(path):
 def validate_recipe(recipe, *, synthetic=False):
     if not isinstance(recipe,dict) or set(recipe)!=REQUIRED_RECIPE: raise ValueError("protocol recipe has unknown or missing fields")
     if recipe["status"]!="FROZEN": raise ValueError("protocol is not frozen")
-    if recipe["seed_list"]!=SEEDS or recipe["arms"]!=ARMS: raise ValueError("main matrix must be exactly five paired seeds and three arms")
+    if recipe["seed_list"]!=SEEDS or recipe["arms"] not in (ARMS,LOOPED_MATRIX): raise ValueError("main matrix must be exactly five paired seeds and three arms")
+    looped = recipe["arms"] == LOOPED_MATRIX
     for key in ("imgsz","batch_size","epochs","cadence","block_size","probe_size"):
         if type(recipe[key]) is not int or recipe[key] < 1: raise ValueError(f"invalid fixed {key}")
     geometry_ok = recipe["imgsz"] >= 64 and recipe["imgsz"] % 32 == 0 if synthetic else recipe["imgsz"] in (512,640)
@@ -44,6 +51,38 @@ def validate_recipe(recipe, *, synthetic=False):
         value=recipe[key]
         if not isinstance(value,str) or len(value)!=64 or not set(value)<=set("0123456789abcdef"):
             raise ValueError(f"invalid artifact file digest: {key}")
+    if looped:
+        env=recipe["environment"]
+        if not isinstance(env,dict) or env.get("study_id") != "looped_v1" or env.get("looped_architecture") != LOOPED_ARCHITECTURE:
+            raise ValueError("looped study architecture contract mismatch")
+        reference=env.get("reference_native")
+        if not isinstance(reference,dict) or set(reference)!={"protocol","freeze"}:
+            raise ValueError("looped study requires explicit native reference provenance")
+        for name, required in (("protocol", {"path", "sha256", "recipe_sha256"}),
+                               ("freeze", {"path", "sha256"})):
+            item = reference.get(name)
+            if not isinstance(item, dict) or set(item) != required:
+                raise ValueError("native source bindings have an invalid schema")
+            path = item["path"]
+            from pathlib import PurePosixPath
+            if (not isinstance(path, str) or "\\" in path or
+                    str(PurePosixPath(path)) != path or PurePosixPath(path).is_absolute() or
+                    any(part in ("", ".", "..") for part in path.split("/"))):
+                raise ValueError("native source path must be normalized and relative")
+            for key in required - {"path"}:
+                value = item[key]
+                if (not isinstance(value, str) or len(value) != 64 or
+                        any(char not in "0123456789abcdef" for char in value)):
+                    raise ValueError("invalid native source digest")
+        if not synthetic:
+            if (reference["protocol"]["sha256"] != OLD_PROTOCOL_FILE_SHA256 or
+                    reference["protocol"]["recipe_sha256"] != OLD_RECIPE_SHA256 or
+                    reference["freeze"]["sha256"] != OLD_FREEZE_SHA256):
+                raise ValueError("looped native source must bind the pinned original artifacts")
+            if (recipe["imgsz"],recipe["batch_size"],recipe["block_size"],recipe["epochs"],recipe["cadence"],recipe["probe_size"]) != (512,32,32,40,5,1000):
+                raise ValueError("looped production scientific dose differs")
+            expected={str(seed):GPU_UUIDS[1 if seed in (11,33,55) else 0] for seed in SEEDS}
+            if assignment != expected: raise ValueError("looped GPU assignment differs from paired native controls")
     if not synthetic:
         evidence=recipe["cache_evidence"]
         if recipe["producer"] not in GPU_UUIDS or not isinstance(evidence,dict) or set(evidence)!={"few","dev","probe"}:
