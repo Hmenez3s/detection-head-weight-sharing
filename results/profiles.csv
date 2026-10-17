@@ -1,0 +1,25 @@
+seed,arm,measurement,batch,gpu,serialized_head_plus_trunk_bytes,conv_macs,peak_allocated_bytes,mean_full_ms,warmup,repetitions,training_probe_scope
+11,native,inference,1,GPU-08055392-87d6-8287-947d-0bf94c711445,10581546,1906679808,64081408,19.330175000504823,5,20,
+11,native,inference,32,GPU-08055392-87d6-8287-947d-0bf94c711445,10581546,61013753856,681692672,21.008759998949245,5,20,
+11,native,training,1,GPU-08055392-87d6-8287-947d-0bf94c711445,10581546,,60092416,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+11,native,training,32,GPU-08055392-87d6-8287-947d-0bf94c711445,10581546,,1501758464,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+11,independent_k2,inference,1,GPU-08055392-87d6-8287-947d-0bf94c711445,10857298,2008006656,64354816,22.600640000018757,5,20,
+11,independent_k2,inference,32,GPU-08055392-87d6-8287-947d-0bf94c711445,10857298,64256212992,681966080,23.947725001198705,5,20,
+11,independent_k2,training,1,GPU-08055392-87d6-8287-947d-0bf94c711445,10857298,,72343552,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+11,independent_k2,training,32,GPU-08055392-87d6-8287-947d-0bf94c711445,10857298,,1865856000,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+11,shared_k2,inference,1,GPU-08055392-87d6-8287-947d-0bf94c711445,10586410,2008006656,64081408,22.40428000004613,5,20,
+11,shared_k2,inference,32,GPU-08055392-87d6-8287-947d-0bf94c711445,10586410,64256212992,681692672,23.68079499938176,5,20,
+11,shared_k2,training,1,GPU-08055392-87d6-8287-947d-0bf94c711445,10586410,,71464960,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+11,shared_k2,training,32,GPU-08055392-87d6-8287-947d-0bf94c711445,10586410,,1864979456,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+22,native,inference,1,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10581546,1906679808,90906112,19.51458000112325,5,20,
+22,native,inference,32,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10581546,61013753856,681692672,56.996660000731936,5,20,
+22,native,training,1,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10581546,,60092416,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+22,native,training,32,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10581546,,1500552704,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+22,independent_k2,inference,1,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10857298,2008006656,91179520,21.580340000218712,5,20,
+22,independent_k2,inference,32,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10857298,64256212992,681966080,62.477015001059044,5,20,
+22,independent_k2,training,1,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10857298,,72343552,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+22,independent_k2,training,32,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10857298,,1864781312,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+22,shared_k2,inference,1,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10586410,2008006656,90906112,21.126545001607155,5,20,
+22,shared_k2,inference,32,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10586410,64256212992,681692672,62.57253499716171,5,20,
+22,shared_k2,training,1,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10586410,,71464960,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
+22,shared_k2,training,32,GPU-13916c7e-aa3c-fa5e-48ef-7b8cca10ea99,10586410,,1863902720,,,,"one warmup native loss/optimizer step plus measured second step; brief probe, not uninterrupted main-fit peak"
