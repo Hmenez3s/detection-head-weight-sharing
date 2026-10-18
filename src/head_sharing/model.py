@@ -170,8 +170,9 @@ class HeadStudyModel(nn.Module):
         if arm not in ALL_ARMS:
             raise ValueError(f"unsupported arm: {arm}")
         canonical_spec = canonicalize_head_spec(head_spec)
-        if canonical_spec is not None and arm != "loop_ab2":
-            raise ValueError("nondefault head_spec is supported only for loop_ab2")
+        if canonical_spec is not None and ((canonical_spec["version"] == 1 and arm != "loop_ab2") or
+                                           (canonical_spec["version"] == 2 and arm != "native")):
+            raise ValueError("head_spec version is not supported for this arm")
         self.head_spec = canonical_spec
         self.arm, self.seed, self.imgsz = arm, int(seed), imgsz
         with torch.random.fork_rng(devices=[]):
@@ -180,6 +181,8 @@ class HeadStudyModel(nn.Module):
         self.detector.end2end = True
         self.detect = self.detector.model[-1]
         self._assert_native_structure()
+        if canonical_spec is not None and canonical_spec["version"] == 2:
+            self._install_spatial_variant(canonical_spec["variant"])
         if arm in LEGACY_ARMS and arm != "native":
             self._replace_second_units(shared=arm == "shared_k2")
         elif arm in LOOPED_ARMS:
@@ -200,6 +203,48 @@ class HeadStudyModel(nn.Module):
         assert tuple(layer[0].conv.out_channels for layer in d.cv2) == (16, 16, 16)
         assert tuple(layer[0][0].conv.in_channels for layer in d.cv3) == (64, 128, 256)
         assert tuple(layer[0][1].conv.out_channels for layer in d.cv3) == (80, 80, 80)
+
+    def _install_spatial_variant(self, variant: str) -> None:
+        d = self.detect
+        with torch.random.fork_rng(devices=[]):
+            for box_name, cls_name in (("cv2", "cv3"), ("one2one_cv2", "one2one_cv3")):
+                for modules, sites, groups in ((getattr(d, box_name), ((1,),), 8),
+                                                (getattr(d, cls_name), ((1, 0), (1, 1)), 16)):
+                    sources = [modules[0][site[0]] if len(site) == 1 else modules[0][site[0]][site[1]] for site in sites]
+                    source_modules = [modules[level][site[0]] if len(site) == 1 else modules[level][site[0]][site[1]]
+                                     for site in sites for level in range(3)]
+                    for index, source in enumerate(sources):
+                        family = source_modules[index * 3:index * 3 + 3]
+                        canonical = family[0]
+                        for target in family:
+                            conv = target.conv
+                            if variant == "spatial_sepbn_k5" and conv.kernel_size == (3, 3):
+                                replacement = nn.Conv2d(conv.in_channels, conv.out_channels, 5, stride=conv.stride,
+                                                        padding=2, dilation=conv.dilation, groups=conv.groups,
+                                                        bias=conv.bias is not None, padding_mode=conv.padding_mode,
+                                                        device=conv.weight.device, dtype=conv.weight.dtype)
+                                with torch.no_grad():
+                                    replacement.weight.zero_()
+                                    replacement.weight[:, :, 1:4, 1:4].copy_(conv.weight)
+                                    if conv.bias is not None: replacement.bias.copy_(conv.bias)
+                                target.conv = replacement
+                        for level in range(1, 3):
+                            target = family[level]
+                            if variant == "spatial_untied":
+                                with torch.no_grad():
+                                    target.conv.weight.copy_(canonical.conv.weight)
+                            else:
+                                target.conv.weight = canonical.conv.weight
+                        if variant == "spatial_gn":
+                            channels = canonical.bn.num_features
+                            norm = nn.GroupNorm(groups, channels, eps=canonical.bn.eps, affine=True,
+                                                device=canonical.bn.weight.device, dtype=canonical.bn.weight.dtype)
+                            for target in family:
+                                target.bn = norm
+                if variant == "spatial_sepbn_sharedpred":
+                    for modules in (getattr(d, box_name), getattr(d, cls_name)):
+                        for level in (1, 2):
+                            modules[level][-1].weight = modules[0][-1].weight
 
     @staticmethod
     def _configure_looped_tower(tower: PointTower, variant: str, inner_width: int) -> None:

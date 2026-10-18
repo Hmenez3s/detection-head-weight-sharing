@@ -154,8 +154,9 @@ def _read_config(path: str | Path) -> dict[str, Any]:
         spec = canonicalize_head_spec(config["head_spec"])
         if spec is None or spec != config["head_spec"]:
             raise ValueError("format 2 requires a canonical nondefault head_spec")
-        if config["arm"] != "loop_ab2":
-            raise ValueError("nondefault head_spec requires loop_ab2")
+        expected_arm = "loop_ab2" if spec["version"] == 1 else "native"
+        if config["arm"] != expected_arm:
+            raise ValueError("nondefault head_spec does not match checkpoint arm")
     validate_trunk_receipt(config["trunk_receipt"])
     return config
 
