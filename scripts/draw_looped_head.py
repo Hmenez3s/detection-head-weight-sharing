@@ -2,7 +2,9 @@
 """Draw assets/looped-head.png: the three studied heads, stacked: native, loop_ab2 and loop_a3.
 
 Block height is proportional to channel width; blue/orange/green mark weights of one scale and
-purple marks weights shared by P, M and G. Looped-head compute is a design estimate, not a measurement.
+purple marks weights shared by P, M and G. The numbers in the table are measured values from the
+v0.2.0 release profiles (results/looped/profiles.csv, seed 11, batch 1, 512 px); all three arms were trained
+(15 closed 40-epoch fits). Only Conv MACs are counted; norm, activation, add and decoding are not.
 """
 from pathlib import Path
 import matplotlib
@@ -64,7 +66,7 @@ ax.text(85, 330.5, "YOLO26n detection head: native vs. two looped designs", ha="
         fontsize=20, fontweight="bold", color=INK)
 ax.text(85, 326.4, "block height = number of channels   ·   blue / orange / green = weights of one scale   ·   "
         "purple = weights shared by P, M and G", ha="center", va="center", fontsize=11, color=GREY)
-ax.text(85, 322.9, "one internal copy is drawn; native is the existing control, the two looped arms are not yet trained", ha="center",
+ax.text(85, 322.9, "one internal copy is drawn  ·  all three arms: 40-epoch fits complete  ·  table values are measured at 512 px", ha="center",
         va="center", fontsize=10, color=GREY)
 
 
@@ -238,9 +240,12 @@ rows_txt = [("", "native", "loop_ab2", "loop_a3"),
             ("applications per point", "2 blocks", "A → B twice = 4", "A three times = 3"),
             ("conv applications / internal copy", "24", "22", "20"),
             ("spatial view of the input map", "5×5", "3×3 (adapter only)", "3×3 (adapter only)"),
-            ("head MACs, both internal branches", "384.6 M (counted)", "≈ 631.4 M (estimate)",
-             "≈ 636.9 M (estimate)")]
-ax.add_patch(FancyBboxPatch((8, 17.8), 154, 21.4, boxstyle="round,pad=0.2,rounding_size=1",
+            ("head params, both internal branches", "309,656", "181,920", "183,504"),
+            ("head Conv MACs, both internal branches", "384.6 M (measured)", "631.4 M (measured)",
+             "636.9 M (measured)"),
+            ("head Conv MACs, one2one branch only", "192.3 M (measured)", "315.7 M (measured)",
+             "318.5 M (measured)")]
+ax.add_patch(FancyBboxPatch((8, 12.0), 154, 27.2, boxstyle="round,pad=0.2,rounding_size=1",
                             fc="#F9FAFB", ec=RULE, lw=1, zorder=.5))
 for i, row in enumerate(rows_txt):
     yy = 37.6 - i * 2.9
@@ -248,12 +253,14 @@ for i, row in enumerate(rows_txt):
     for xc, txt, col in zip((70, 103, 137), row[1:], (SCALE["P"], SHARED, SHARED)):
         ax.text(xc, yy, txt, ha="center", va="center", fontsize=10, color=col if i == 0 else INK,
                 fontweight="bold" if i == 0 else "normal")
-ax.text(85, 14.6, "MACs are for the head only at 512 px and count both internal branches (one2many and one2one) of the end-to-end "
-        "YOLO26n head; native is counted in the unfused reference,\nloop values are design estimates. "
-        "A fused deployed head keeps one branch: ≈ 192 M native, ≈ 316 M loop_ab2, ≈ 318 M loop_a3. Not latency. "
-        "Spatial view = 3×3 or 5×5 on the head's input feature map.\nConv applications count layer applications per internal copy "
-        "(not GPU kernels). The two looped arms have not yet been trained.", ha="center", va="top", fontsize=8.4, color=GREY,
-        linespacing=1.5)
+ax.text(85, 9.2, "Measured per 512 px image from the release profiles (results/looped/profiles.csv): unique head parameters and Conv MACs only; "
+        "norm, activation, add and decoding are not counted.\n"
+        "The end-to-end YOLO26n head has two internal branches (one2many and one2one); \"one2one branch only\" is the branch-pruned "
+        "inference head, not a fused-BatchNorm model.\n"
+        "Conv MACs are not latency. Spatial view = 3×3 or 5×5 on the head's input feature map; conv applications count layers per internal copy, "
+        "not GPU kernels.\n"
+        "Head parameters fall about 41% while head compute rises about 64–66% versus native; accuracy, latency and memory are in the README.",
+        ha="center", va="top", fontsize=8.4, color=GREY, linespacing=1.5)
 
 OUT.parent.mkdir(parents=True, exist_ok=True)
 fig.savefig(OUT, bbox_inches="tight", facecolor="white")
