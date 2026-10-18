@@ -1,0 +1,16 @@
+contrast,seed,delta_pp
+primary_loop_ab2_minus_native,11,-0.600771134954925
+primary_loop_ab2_minus_native,22,-0.5741967749768401
+primary_loop_ab2_minus_native,33,-0.563399721804228
+primary_loop_ab2_minus_native,44,-0.7623694291234301
+primary_loop_ab2_minus_native,55,-0.4455618708926745
+primary_loop_a3_minus_native,11,-0.926528905580376
+primary_loop_a3_minus_native,22,-0.8451645661622431
+primary_loop_a3_minus_native,33,-0.6097649640225661
+primary_loop_a3_minus_native,44,-0.60652533369491
+primary_loop_a3_minus_native,55,-0.6788882390210776
+secondary_loop_a3_minus_loop_ab2,11,-0.3257577706254511
+secondary_loop_a3_minus_loop_ab2,22,-0.27096779118540304
+secondary_loop_a3_minus_loop_ab2,33,-0.04636524221833804
+secondary_loop_a3_minus_loop_ab2,44,0.15584409542852007
+secondary_loop_a3_minus_loop_ab2,55,-0.23332636812840313
