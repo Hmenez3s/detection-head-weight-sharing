@@ -19,6 +19,96 @@ RECEIPT = {
 }
 
 
+def test_default_ab2_state_matches_independent_oracle():
+    import hashlib
+    baseline = HeadStudyModel("loop_ab2", 11, 32)
+    explicit = HeadStudyModel("loop_ab2", 11, 32, head_spec={"version": 1, "variant": "baseline", "class_inner": 96})
+    digest = hashlib.sha256()
+    for name, tensor in baseline.detect.state_dict().items():
+        digest.update(name.encode())
+        digest.update(str(tensor.dtype).encode())
+        digest.update(str(tuple(tensor.shape)).encode())
+        digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    assert digest.hexdigest() == "74030da2b78acadc3cdf462191c18d947c9e5d9686b21f50bb62a8ea316ff5ef"
+    assert list(baseline.detect.state_dict()) == list(explicit.detect.state_dict())
+    assert all(torch.equal(v, explicit.detect.state_dict()[k]) for k, v in baseline.detect.state_dict().items())
+
+
+def test_default_ab2_outputs_match_prechange_four_tower_oracle():
+    import hashlib
+    import torch
+    from head_sharing.model import HeadStudyModel
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(3)
+    try:
+        model = HeadStudyModel("loop_ab2", 11, 32).eval()
+        generator = torch.Generator().manual_seed(2026)
+        features = [torch.randn(2, channels, side, side, generator=generator).to(torch.float16).float()
+                    for channels, side in ((64, 4), (128, 2), (256, 1))]
+        digest = hashlib.sha256()
+        with torch.inference_mode():
+            for name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
+                tensor = getattr(model.detect, name)[0](features, "loop_ab2")
+                digest.update(name.encode())
+                digest.update(str(tensor.dtype).encode())
+                digest.update(str(tuple(tensor.shape)).encode())
+                digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+        assert digest.hexdigest() == "d015edc3d0de71d45cead22a8bf0ed7a8db8de329494cf8eb8f6335ec3ab75ce"
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
+def test_head_spec_canonicalization_alpha_and_diagnostics():
+    from head_sharing.head_spec import canonicalize_head_spec, head_spec_digest
+    from head_sharing.model import diagnose_ab2_updates
+    baseline = {"version": 1, "variant": "baseline", "class_inner": 96}
+    alpha_spec = {"version": 1, "variant": "learned_alpha", "class_inner": 96}
+    assert canonicalize_head_spec(baseline) is None
+    assert head_spec_digest(alpha_spec) == head_spec_digest(dict(alpha_spec))
+    for invalid in ({**alpha_spec, "extra": 1}, {"version": True, "variant": "learned_alpha", "class_inner": 96},
+                    {"version": 1, "variant": "learned_alpha", "class_inner": True}):
+        with pytest.raises(ValueError): canonicalize_head_spec(invalid)
+    with pytest.raises(ValueError, match="only for loop_ab2"):
+        HeadStudyModel("native", 11, 32, head_spec=alpha_spec)
+    for unsupported in ("step_norm", "scale_gain", "dw5"):
+        with pytest.raises(ValueError, match="not implemented"):
+            HeadStudyModel("loop_ab2", 11, 32, head_spec={"version": 1, "variant": unsupported, "class_inner": 96})
+
+    torch.set_num_threads(1)
+    rng_before = torch.get_rng_state().clone()
+    baseline_model = HeadStudyModel("loop_ab2", 11, 32).eval()
+    model = HeadStudyModel("loop_ab2", 11, 32, head_spec=alpha_spec).eval()
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    towers = [model.detect.cv2[0], model.detect.cv3[0], model.detect.one2one_cv2[0], model.detect.one2one_cv3[0]]
+    assert all(t.alpha.shape == (2,) and torch.equal(t.alpha, torch.full((2,), .1)) for t in towers)
+    features = [torch.randn(2, c, n, n) for c, n in ((64, 4), (128, 2), (256, 1))]
+    base_out = baseline_model.forward_features(features)
+    alpha_out = model.forward_features(features)
+    for key in ("one2many", "one2one"):
+        assert torch.equal(base_out[1][key]["boxes"], alpha_out[1][key]["boxes"])
+        assert torch.equal(base_out[1][key]["scores"], alpha_out[1][key]["scores"])
+    before_state = {k: v.clone() for k, v in model.state_dict().items()}
+    before_mode = model.training
+    before_rng = torch.get_rng_state().clone()
+    diagnostic = diagnose_ab2_updates(model, features)
+    assert set(diagnostic) == {"cv2", "cv3", "one2one_cv2", "one2one_cv3"}
+    assert all(len(records) == 2 and all(torch.isfinite(torch.tensor(list(r.values()))).all() for r in records)
+               for records in diagnostic.values())
+    assert model.training == before_mode and torch.equal(torch.get_rng_state(), before_rng)
+    assert all(torch.equal(v, model.state_dict()[k]) for k, v in before_state.items())
+    from head_sharing.train import optimizer_groups
+    optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01)
+    optimizer.zero_grad(set_to_none=True)
+    sum(output["boxes"].sum() + output["scores"].sum()
+        for output in (alpha_out[1]["one2many"], alpha_out[1]["one2one"])).backward()
+    assert all(t.alpha.grad is not None and torch.isfinite(t.alpha.grad).all() for t in towers)
+    assert all(p.grad is None for p in model.detector.model[:-1].parameters())
+    assert all(id(t.alpha) in {id(p) for p in optimizer.param_groups[1]["params"]} for t in towers)
+    old_alpha = [tower.alpha.detach().clone() for tower in towers]
+    optimizer.step()
+    assert all(not torch.equal(old, tower.alpha) for old, tower in zip(old_alpha, towers, strict=True))
+
+
 def test_cli_help_is_available(capsys):
     with pytest.raises(SystemExit) as exit_info:
         main(["--help"])

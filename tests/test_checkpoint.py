@@ -1,3 +1,4 @@
+import copy
 import random
 
 import numpy as np
@@ -6,6 +7,97 @@ import torch
 from head_sharing.checkpoint import load_resume, save_resume
 from head_sharing.model import HeadStudyModel
 from head_sharing.train import optimizer_groups
+
+
+def test_ab2_spec_checkpoint_and_resume_identity(tmp_path):
+    import json
+    import pytest
+    from head_sharing.checkpoint import _read_config, load_checkpoint, save_checkpoint
+    from head_sharing.head_spec import head_spec_digest
+    from head_sharing.model import HeadStudyModel
+    receipt = {
+        "trunk_artifact_sha256": "f01ec41445fac9ef7078b48ef1b73473e6314bcb1a77e77c20666d6ecfcd9016",
+        "trunk_tensors": 468, "trunk_bytes": 9_109_168, "head_index": 23,
+        "input_channels": [64, 128, 256], "source_variant": "U", "source_seed": 11,
+        "source_epoch_zero_based": 79, "source_training_epochs": 80,
+        "pre_exposure": "Synthetic test receipt.",
+    }
+    trunk = {k: v.detach().clone() for k, v in HeadStudyModel("loop_ab2", 11, 32).detector.state_dict().items()
+             if k.startswith("model.") and int(k.split(".")[1]) < 23}
+    artifact = {"state_dict": trunk, "schema_version": 1, "architecture": "yolo26n",
+                "upstream": "8.4.177", "excluded_head_index": 23}
+    features = [torch.randn(2, c, n, n) for c, n in ((64, 4), (128, 2), (256, 1))]
+    base = HeadStudyModel("loop_ab2", 11, 32).eval()
+    base_weights, base_config = tmp_path / "base.pt", tmp_path / "base.json"
+    save_checkpoint(base, base_weights, base_config, receipt)
+    assert json.loads(base_config.read_text()) == {"format": 1, "architecture": "yolo26n", "arm": "loop_ab2",
+        "seed": 11, "imgsz": 32, "quantization": base.quantization, "trunk_receipt": receipt}
+    spec = {"version": 1, "variant": "learned_alpha", "class_inner": 96}
+    model = HeadStudyModel("loop_ab2", 11, 32, head_spec=spec).eval()
+    weights, config = tmp_path / "alpha.pt", tmp_path / "alpha.json"
+    save_checkpoint(model, weights, config, receipt)
+    saved_config = json.loads(config.read_text())
+    assert saved_config["format"] == 2 and saved_config["head_spec"] == spec
+    restored = load_checkpoint(weights, config, trunk_artifact=artifact, synthetic_trunk=True)
+    assert restored.head_spec == spec
+    for branch in ("one2many", "one2one"):
+        expected = model.forward_features(features)[1][branch]
+        actual = restored.forward_features(features)[1][branch]
+        assert torch.equal(expected["boxes"], actual["boxes"])
+        assert torch.equal(expected["scores"], actual["scores"])
+    optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01, momentum=.9)
+    resume = tmp_path / "alpha-resume.pt"
+    save_resume(model, optimizer, resume, epoch=0)
+    payload = torch.load(resume, weights_only=True)
+    assert payload["head_spec"] == spec and payload["head_spec_sha256"] == head_spec_digest(spec)
+    resumed = HeadStudyModel("loop_ab2", 11, 32, head_spec=spec).eval()
+    resumed_optimizer = torch.optim.SGD(optimizer_groups(resumed, .0005), lr=.01, momentum=.9)
+    assert load_resume(resumed, resumed_optimizer, resume) == 0
+    for branch in ("one2many", "one2one"):
+        expected = model.forward_features(features)[1][branch]
+        actual = resumed.forward_features(features)[1][branch]
+        assert torch.equal(expected["boxes"], actual["boxes"])
+        assert torch.equal(expected["scores"], actual["scores"])
+    model.train(); resumed.train()
+    for candidate, candidate_optimizer in ((model, optimizer), (resumed, resumed_optimizer)):
+        candidate_optimizer.zero_grad(set_to_none=True)
+        result = candidate.forward_features(features)
+        (result["one2many"]["boxes"].sum() + result["one2one"]["scores"].sum()).backward()
+        candidate_optimizer.step()
+    assert all(torch.equal(value, resumed.detect.state_dict()[key])
+               for key, value in model.detect.state_dict().items())
+    wrong = HeadStudyModel("loop_ab2", 22, 32)
+    wrong_optimizer = torch.optim.SGD(optimizer_groups(wrong, .0005), lr=.01, momentum=.9)
+    before = {k: v.clone() for k, v in wrong.detect.state_dict().items()}
+    with pytest.raises(ValueError, match="identity"):
+        load_resume(wrong, wrong_optimizer, resume)
+    assert all(torch.equal(v, wrong.detect.state_dict()[k]) for k, v in before.items())
+    mismatched_payload = dict(payload, head_spec={"version": 1, "variant": "learned_alpha", "class_inner": 48})
+    from head_sharing.head_spec import head_spec_digest
+    mismatched_payload["head_spec_sha256"] = head_spec_digest(mismatched_payload["head_spec"])
+    mismatched_resume = tmp_path / "mismatched-resume.pt"
+    torch.save(mismatched_payload, mismatched_resume)
+    target_before = {k: v.clone() for k, v in model.detect.state_dict().items()}
+    with pytest.raises(ValueError, match="identity"):
+        load_resume(model, optimizer, mismatched_resume)
+    assert all(torch.equal(v, model.detect.state_dict()[k]) for k, v in target_before.items())
+    malformed_identity = dict(payload, head_spec={**spec, "version": True})
+    bool_version_resume = tmp_path / "bool-version-resume.pt"
+    torch.save(malformed_identity, bool_version_resume)
+    optimizer_before = copy.deepcopy(optimizer.state_dict())
+    rng_before = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="identity"):
+        load_resume(model, optimizer, bool_version_resume)
+    assert all(torch.equal(v, model.detect.state_dict()[k]) for k, v in target_before.items())
+    optimizer_after = optimizer.state_dict()
+    assert optimizer_after["param_groups"] == optimizer_before["param_groups"]
+    assert optimizer_after["state"].keys() == optimizer_before["state"].keys()
+    assert all(torch.equal(optimizer_after["state"][pid][name], value)
+               for pid, values in optimizer_before["state"].items() for name, value in values.items())
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    malformed = dict(saved_config, head_spec={**spec, "extra": True})
+    config.write_text(json.dumps(malformed))
+    with pytest.raises(ValueError): _read_config(config)
 
 
 def test_looped_heads_strict_checkpoint_and_resume_roundtrip(tmp_path):

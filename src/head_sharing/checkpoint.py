@@ -16,8 +16,10 @@ import torch
 
 from . import ALL_ARMS
 from .model import HeadStudyModel
+from .head_spec import canonicalize_head_spec, head_spec_digest
 
 CONFIG_KEYS = {"format", "architecture", "arm", "seed", "imgsz", "quantization", "trunk_receipt"}
+CONFIG_V2_KEYS = CONFIG_KEYS | {"head_spec"}
 RECEIPT_KEYS = {
     "trunk_artifact_sha256", "trunk_tensors", "trunk_bytes", "head_index", "input_channels", "source_variant",
     "source_seed", "source_epoch_zero_based", "source_training_epochs", "pre_exposure",
@@ -123,6 +125,9 @@ def save_checkpoint(model: HeadStudyModel, weights_path: str | Path, config_path
     _atomic_save(state, weights_path)
     config = {"format": 1, "architecture": model.architecture, "arm": model.arm, "seed": model.seed,
               "imgsz": model.imgsz, "quantization": model.quantization, "trunk_receipt": trunk_receipt}
+    if model.head_spec is not None:
+        config["format"] = 2
+        config["head_spec"] = model.head_spec
     config_path.write_text(json.dumps(config, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 
@@ -131,9 +136,13 @@ def _read_config(path: str | Path) -> dict[str, Any]:
         config = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("invalid checkpoint config JSON") from exc
-    if not isinstance(config, dict) or set(config) != CONFIG_KEYS:
+    if not isinstance(config, dict):
         raise ValueError("checkpoint config has unknown or missing fields")
-    if type(config["format"]) is not int or config["format"] != 1 or config["architecture"] != "yolo26n":
+    version = config.get("format")
+    expected_keys = CONFIG_KEYS if version == 1 else CONFIG_V2_KEYS if version == 2 else None
+    if expected_keys is None or set(config) != expected_keys:
+        raise ValueError("checkpoint config has unknown or missing fields")
+    if type(config["format"]) is not int or config["architecture"] != "yolo26n":
         raise ValueError("unsupported checkpoint format or architecture")
     if config["arm"] not in ALL_ARMS:
         raise ValueError("unknown checkpoint arm")
@@ -141,6 +150,12 @@ def _read_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("checkpoint seed and image size must be integers")
     if config["quantization"] != HeadStudyModel.quantization:
         raise ValueError("checkpoint quantization policy mismatch")
+    if version == 2:
+        spec = canonicalize_head_spec(config["head_spec"])
+        if spec is None or spec != config["head_spec"]:
+            raise ValueError("format 2 requires a canonical nondefault head_spec")
+        if config["arm"] != "loop_ab2":
+            raise ValueError("nondefault head_spec requires loop_ab2")
     validate_trunk_receipt(config["trunk_receipt"])
     return config
 
@@ -148,7 +163,8 @@ def _read_config(path: str | Path) -> dict[str, Any]:
 def load_checkpoint(weights_path: str | Path, config_path: str | Path, *, trunk_artifact: dict[str, Any] | str | Path,
                     synthetic_trunk: bool = False, map_location: str = "cpu") -> HeadStudyModel:
     config = _read_config(config_path)
-    model = HeadStudyModel(config["arm"], config["seed"], config["imgsz"])
+    model = HeadStudyModel(config["arm"], config["seed"], config["imgsz"],
+                           head_spec=config.get("head_spec"))
     try:
         state = torch.load(weights_path, map_location=map_location, weights_only=True)
     except (OSError, RuntimeError, EOFError) as exc:
@@ -256,8 +272,12 @@ def save_resume(model: HeadStudyModel, optimizer: torch.optim.Optimizer, path: s
         raise ValueError("epoch must be non-negative")
     if training_state is not None and (not isinstance(training_state, dict) or not _primitive_state(training_state)):
         raise ValueError("training state must contain only primitives and tensors")
-    _atomic_save({"model": _cpu_head_state(model), "optimizer": optimizer.state_dict(), "epoch": epoch,
-                "training_state": training_state, "rng": _rng_state()}, path)
+    payload = {"model": _cpu_head_state(model), "optimizer": optimizer.state_dict(), "epoch": epoch,
+               "training_state": training_state, "rng": _rng_state()}
+    if model.head_spec is not None:
+        payload["head_spec"] = model.head_spec
+        payload["head_spec_sha256"] = head_spec_digest(model.head_spec)
+    _atomic_save(payload, path)
 
 
 def load_resume(model: HeadStudyModel, optimizer: torch.optim.Optimizer, path: str | Path, *,
@@ -266,8 +286,22 @@ def load_resume(model: HeadStudyModel, optimizer: torch.optim.Optimizer, path: s
         payload = torch.load(path, map_location="cpu", weights_only=True)
     except (OSError, RuntimeError, EOFError) as exc:
         raise ValueError("invalid resume checkpoint") from exc
-    if not isinstance(payload, dict) or set(payload) not in ({"model", "optimizer", "epoch"}, {"model", "optimizer", "epoch", "training_state", "rng"}):
+    if not isinstance(payload, dict):
         raise ValueError("invalid resume checkpoint structure")
+    old_shapes = ({"model", "optimizer", "epoch"}, {"model", "optimizer", "epoch", "training_state", "rng"})
+    has_spec = model.head_spec is not None
+    expected_keys = {"model", "optimizer", "epoch", "training_state", "rng", "head_spec", "head_spec_sha256"}
+    if has_spec:
+        try:
+            payload_spec = canonicalize_head_spec(payload.get("head_spec"))
+        except ValueError as exc:
+            raise ValueError("resume head_spec identity mismatch") from exc
+        if (set(payload) != expected_keys or payload_spec is None or payload_spec != payload.get("head_spec")
+                or payload_spec != model.head_spec
+                or payload.get("head_spec_sha256") != head_spec_digest(model.head_spec)):
+            raise ValueError("resume head_spec identity mismatch")
+    elif set(payload) not in old_shapes or any(key in payload for key in ("head_spec", "head_spec_sha256")):
+        raise ValueError("invalid resume checkpoint structure or head_spec identity")
     training_state = payload.get('training_state')
     if training_state is not None and (not isinstance(training_state, dict) or not _primitive_state(training_state)):
         raise ValueError('invalid resume training state')

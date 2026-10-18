@@ -12,12 +12,13 @@ from ultralytics.nn.modules.head import Detect
 from ultralytics.nn.tasks import DetectionModel
 
 from . import ALL_ARMS, LEGACY_ARMS, LOOPED_ARMS
+from .head_spec import canonicalize_head_spec
 
 Arm = Literal["native", "independent_k2", "shared_k2", "loop_ab2", "loop_a3"]
 
 
 class PointTower(nn.Module):
-    def __init__(self, widths: tuple[int, int, int], output: int, arm: str):
+    def __init__(self, widths: tuple[int, int, int], output: int, arm: str, *, variant: str = "baseline"):
         super().__init__()
         width = widths[0]
         self.adapters = nn.ModuleList(nn.Sequential(
@@ -34,6 +35,9 @@ class PointTower(nn.Module):
         else:
             self.a = nn.Conv2d(width, width, 1)
             self.passes = 3
+        self.variant = variant
+        if variant == "learned_alpha":
+            self.alpha = nn.Parameter(torch.full((2,), 0.1))
         self.readout = nn.Conv2d(width, output, 1)
         nn.init.zeros_(self.readout.bias)
         self.scale_bias = nn.ParameterList([nn.Parameter(torch.zeros(output)) for _ in range(3)])
@@ -43,6 +47,40 @@ class PointTower(nn.Module):
         # The channel dimension is normalized independently at every point.
         return torch.nn.functional.silu(norm(x.permute(0, 3, 2, 1))).permute(0, 3, 2, 1)
 
+    def _updates(self, h: torch.Tensor, arm: str, observe=None) -> torch.Tensor:
+        for index in range(self.passes):
+            if arm == "loop_ab2":
+                hidden = self._preact(h, self.norm_a)
+                update = self.a(hidden)
+                update = self._preact(update, self.norm_b)
+                update = self.b(update)
+            else:
+                hidden = self._preact(h, self.norm_a)
+                update = self.a(hidden)
+            coefficient = self.alpha[index] if self.variant == "learned_alpha" else 0.1
+            if observe is not None:
+                observe(index, h, update, coefficient)
+            h = h + coefficient * update
+        return h
+
+    @torch.no_grad()
+    def update_diagnostics(self, features: list[torch.Tensor], arm: str) -> list[dict]:
+        points = [(self.adapters[index](feature) + self.scale_id[index][None, :, None, None])
+                  .flatten(2).unsqueeze(2) for index, feature in enumerate(features)]
+        h = torch.cat(points, dim=-1)
+        records = []
+        epsilon = torch.finfo(h.dtype).eps
+        def observe(index, hidden, update, coefficient):
+            hidden_norm = torch.linalg.vector_norm(hidden)
+            scaled_norm = torch.linalg.vector_norm(coefficient * update)
+            alpha = float(coefficient.detach().cpu()) if isinstance(coefficient, torch.Tensor) else float(coefficient)
+            records.append({"update": index + 1, "h_l2": float(hidden_norm.cpu()),
+                            "alphaF_l2": float(scaled_norm.cpu()),
+                            "ratio": float((scaled_norm / hidden_norm.clamp_min(epsilon)).cpu()),
+                            "alpha": alpha})
+        self._updates(h, arm, observe)
+        return records
+
     def forward(self, features: list[torch.Tensor], arm: str, *, level_indices=None) -> torch.Tensor:
         points = []
         indices = list(range(len(features)) if level_indices is None else level_indices)
@@ -50,12 +88,7 @@ class PointTower(nn.Module):
             adapted = self.adapters[index](feature) + self.scale_id[index][None, :, None, None]
             points.append(adapted.flatten(2).unsqueeze(2))
         h = torch.cat(points, dim=-1)
-        for _ in range(self.passes):
-            if arm == "loop_ab2":
-                update = self.b(self._preact(self.a(self._preact(h, self.norm_a)), self.norm_b))
-            else:
-                update = self.a(self._preact(h, self.norm_a))
-            h = h + 0.1 * update
+        h = self._updates(h, arm)
         output = self.readout(h)
         counts = [item.shape[-2] * item.shape[-1] for item in features]
         outputs = []
@@ -64,6 +97,17 @@ class PointTower(nn.Module):
             outputs.append(output[..., offset:offset + count] + self.scale_bias[index][None, :, None, None])
             offset += count
         return torch.cat(outputs, dim=-1).squeeze(2)
+
+
+@torch.no_grad()
+def diagnose_ab2_updates(model: "HeadStudyModel", features: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> dict[str, list[dict]]:
+    """Explicitly inspect the actual two residual updates without changing model state."""
+    if model.arm != "loop_ab2":
+        raise ValueError("update diagnostics require loop_ab2")
+    quantized = model.quantize_features(features)
+    towers = (("cv2", model.detect.cv2[0]), ("cv3", model.detect.cv3[0]),
+              ("one2one_cv2", model.detect.one2one_cv2[0]), ("one2one_cv3", model.detect.one2one_cv3[0]))
+    return {name: tower.update_diagnostics(quantized, model.arm) for name, tower in towers}
 
 
 class LoopedDetect(Detect):
@@ -110,11 +154,17 @@ class HeadStudyModel(nn.Module):
     architecture = "yolo26n"
     quantization = "fp32_fp16_fp32_v1"
 
-    def __init__(self, arm: Arm = "native", seed: int = 11, imgsz: int = 640, *, model: DetectionModel | None = None):
+    def __init__(self, arm: Arm = "native", seed: int = 11, imgsz: int = 640, *, model: DetectionModel | None = None, head_spec=None):
         super().__init__()
         validate_imgsz(imgsz)
         if arm not in ALL_ARMS:
             raise ValueError(f"unsupported arm: {arm}")
+        canonical_spec = canonicalize_head_spec(head_spec)
+        if canonical_spec is not None and arm != "loop_ab2":
+            raise ValueError("nondefault head_spec is supported only for loop_ab2")
+        if canonical_spec is not None and (canonical_spec["variant"] != "learned_alpha" or canonical_spec["class_inner"] != 96):
+            raise ValueError(f"head_spec {canonical_spec} is recognized but not implemented")
+        self.head_spec = canonical_spec
         self.arm, self.seed, self.imgsz = arm, int(seed), imgsz
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.seed)
@@ -151,8 +201,9 @@ class HeadStudyModel(nn.Module):
         widths = (24, 24, 24) if arm == "loop_ab2" else (28, 28, 28)
         class_widths = (96, 96, 96) if arm == "loop_ab2" else (108, 108, 108)
         for box_name, cls_name in (("cv2", "cv3"), ("one2one_cv2", "one2one_cv3")):
-            box_tower = PointTower(widths, 4, arm)
-            cls_tower = PointTower(class_widths, d.nc, arm)
+            variant = self.head_spec["variant"] if self.head_spec is not None else "baseline"
+            box_tower = PointTower(widths, 4, arm, variant=variant)
+            cls_tower = PointTower(class_widths, d.nc, arm, variant=variant)
             setattr(d, box_name, nn.ModuleList([box_tower]))
             setattr(d, cls_name, nn.ModuleList([cls_tower]))
         d.bias_init()
