@@ -416,7 +416,7 @@ def render_dev_report(study, decision):
         study_qualification = ("This was an adaptive, exploratory n=3 candidate study. Seed 11 selected the candidate; "
                               "seeds 33 and 55 are same-study follow-ups, not independent confirmation.")
     else:
-        study_qualification = (f"This report contains the five-arm seed11 adaptive screen and {len(confirmations)} "
+        study_qualification = (f"This report contains the five-condition seed11 adaptive screen and {len(confirmations)} "
                                "closed winner follow-up(s); it does not contain a complete n=3 candidate group.")
     if failed_rows:
         study_qualification += (f" {len(failed_rows)} of the five MAIN screen conditions failed before reaching the "
@@ -449,7 +449,7 @@ def render_dev_report(study, decision):
         lines.append("Strict improvement over raw seed-11 baseline40 could not be assessed: no condition has an admissible full-dose DEV score; no adaptive follow-ups were admitted.")
     else:
         lines.append(f"Strict improvement over raw seed-11 baseline40 DEV AP {BASELINE11_AP:.17f} was " + ("observed." if decision["improves_baseline40_seed11"] else "not observed; no adaptive follow-ups were admitted."))
-    lines.append("The admitted candidate is a single adaptively chosen trunk variant; this does not show that sharing caused a gain." if decision.get("selected_variant") is not None else "No candidate was admitted by the strict-improvement rule; this screen cannot establish a sharing benefit.")
+    lines.append("The admitted candidate is a single adaptively chosen head variant; this does not show that sharing caused a gain." if decision.get("selected_variant") is not None else "No candidate was admitted by the strict-improvement rule; this screen cannot establish a sharing benefit.")
     lines.append("Cost-stage admission: " + ("admitted under the supplied fresh-MAIN budget and explicit margin." if decision["cost_admitted"] else "skipped or not admitted; cost results are not combined with the quality comparison."))
     lines.append("Skips: " + ("; ".join(decision.get("skips", [])) if decision.get("skips") else "none"))
     groups = {}

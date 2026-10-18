@@ -103,6 +103,8 @@ def test_sealed_json_hash_and_report_are_honest(tmp_path):
                                          "cost": {"seed": 11, "class_inner": 48, "status": "SKIP"}}, decision)
     assert "development-only" in report
     assert "does not contain a complete n=3 candidate group" in report
+    assert "five-condition seed11 adaptive screen" in report
+    assert "single adaptively chosen head variant" in report
     assert "All candidates used one frozen trunk; DEV data were reused" in report
     assert "No new COCO val2017 holdout evaluation was performed" in report
     assert "80-epoch baseline" in report
