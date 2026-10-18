@@ -18,7 +18,7 @@ Arm = Literal["native", "independent_k2", "shared_k2", "loop_ab2", "loop_a3"]
 
 
 class PointTower(nn.Module):
-    def __init__(self, widths: tuple[int, int, int], output: int, arm: str, *, variant: str = "baseline"):
+    def __init__(self, widths: tuple[int, int, int], output: int, arm: str):
         super().__init__()
         width = widths[0]
         self.adapters = nn.ModuleList(nn.Sequential(
@@ -26,28 +26,16 @@ class PointTower(nn.Module):
             nn.Conv2d(channels, width, 1),
         ) for channels in (64, 128, 256))
         self.scale_id = nn.ParameterList([nn.Parameter(torch.zeros(width)) for _ in range(3)])
-        if variant == "step_norm":
-            norm_a = nn.LayerNorm(width, eps=1e-5)
-            norm_b = nn.LayerNorm(width, eps=1e-5)
-            self.norm_a_steps = nn.ModuleList([norm_a, copy.deepcopy(norm_a)])
-            self.norm_b_steps = nn.ModuleList([norm_b, copy.deepcopy(norm_b)])
-        else:
-            self.norm_a = nn.LayerNorm(width, eps=1e-5)
+        self.norm_a = nn.LayerNorm(width, eps=1e-5)
         if arm == "loop_ab2":
-            if variant != "step_norm":
-                self.norm_b = nn.LayerNorm(width, eps=1e-5)
+            self.norm_b = nn.LayerNorm(width, eps=1e-5)
             self.a = nn.Conv2d(width, width, 1)
             self.b = nn.Conv2d(width, width, 1)
             self.passes = 2
-            if variant == "scale_gain":
-                self.gain_a = nn.ParameterList([nn.Parameter(torch.ones(width)) for _ in range(3)])
-                self.gain_b = nn.ParameterList([nn.Parameter(torch.ones(width)) for _ in range(3)])
         else:
             self.a = nn.Conv2d(width, width, 1)
             self.passes = 3
-        self.variant = variant
-        if variant == "learned_alpha":
-            self.alpha = nn.Parameter(torch.full((2,), 0.1))
+        self.variant = "baseline"
         self.readout = nn.Conv2d(width, output, 1)
         nn.init.zeros_(self.readout.bias)
         self.scale_bias = nn.ParameterList([nn.Parameter(torch.zeros(output)) for _ in range(3)])
@@ -184,8 +172,6 @@ class HeadStudyModel(nn.Module):
         canonical_spec = canonicalize_head_spec(head_spec)
         if canonical_spec is not None and arm != "loop_ab2":
             raise ValueError("nondefault head_spec is supported only for loop_ab2")
-        if canonical_spec is not None and (canonical_spec["variant"] not in {"learned_alpha", "step_norm", "scale_gain"} or canonical_spec["class_inner"] != 96):
-            raise ValueError(f"head_spec {canonical_spec} is recognized but not implemented")
         self.head_spec = canonical_spec
         self.arm, self.seed, self.imgsz = arm, int(seed), imgsz
         with torch.random.fork_rng(devices=[]):
@@ -215,6 +201,36 @@ class HeadStudyModel(nn.Module):
         assert tuple(layer[0][0].conv.in_channels for layer in d.cv3) == (64, 128, 256)
         assert tuple(layer[0][1].conv.out_channels for layer in d.cv3) == (80, 80, 80)
 
+    @staticmethod
+    def _configure_looped_tower(tower: PointTower, variant: str, inner_width: int) -> None:
+        width = tower.a.in_channels
+        if inner_width != width:
+            tower.a = nn.Conv2d(width, inner_width, 1)
+            tower.b = nn.Conv2d(inner_width, width, 1)
+            tower.norm_b = nn.LayerNorm(inner_width, eps=1e-5)
+        if variant == "step_norm":
+            norm_a = tower.norm_a
+            norm_b = tower.norm_b
+            tower.norm_a_steps = nn.ModuleList([norm_a, copy.deepcopy(norm_a)])
+            tower.norm_b_steps = nn.ModuleList([norm_b, copy.deepcopy(norm_b)])
+            del tower.norm_a
+            del tower.norm_b
+        elif variant == "scale_gain":
+            tower.gain_a = nn.ParameterList([nn.Parameter(torch.ones(width)) for _ in range(3)])
+            tower.gain_b = nn.ParameterList([nn.Parameter(torch.ones(inner_width)) for _ in range(3)])
+        elif variant == "learned_alpha":
+            tower.alpha = nn.Parameter(torch.full((2,), 0.1))
+        tower.variant = variant
+        if variant == "dw5":
+            for adapter in tower.adapters:
+                dw3, pointwise = adapter
+                channels = dw3.in_channels
+                dw5 = nn.Conv2d(channels, channels, 5, padding=2, groups=channels, bias=False)
+                with torch.no_grad():
+                    dw5.weight.zero_()
+                    dw5.weight[:, :, 1:4, 1:4].copy_(dw3.weight)
+                adapter[0] = dw5
+
     def _install_looped_heads(self, arm: str) -> None:
         d = self.detect
         # Preserve Detect's registered state while installing its native-compatible forward override.
@@ -222,12 +238,21 @@ class HeadStudyModel(nn.Module):
         d.loop_arm = arm
         widths = (24, 24, 24) if arm == "loop_ab2" else (28, 28, 28)
         class_widths = (96, 96, 96) if arm == "loop_ab2" else (108, 108, 108)
+        towers = []
         for box_name, cls_name in (("cv2", "cv3"), ("one2one_cv2", "one2one_cv3")):
-            variant = self.head_spec["variant"] if self.head_spec is not None else "baseline"
-            box_tower = PointTower(widths, 4, arm, variant=variant)
-            cls_tower = PointTower(class_widths, d.nc, arm, variant=variant)
+            box_tower = PointTower(widths, 4, arm)
+            cls_tower = PointTower(class_widths, d.nc, arm)
             setattr(d, box_name, nn.ModuleList([box_tower]))
             setattr(d, cls_name, nn.ModuleList([cls_tower]))
+            towers.extend((box_tower, cls_tower))
+        if self.head_spec is not None:
+            variant = self.head_spec["variant"]
+            inner_width = self.head_spec["class_inner"]
+            # Construct every baseline tower first; variant-specific layers must not shift later towers' draws.
+            with torch.random.fork_rng(devices=[]):
+                for index, tower in enumerate(towers):
+                    is_class_tower = index % 2 == 1
+                    self._configure_looped_tower(tower, variant, inner_width if is_class_tower else tower.a.in_channels)
         d.bias_init()
 
     def _replace_second_units(self, *, shared: bool) -> None:

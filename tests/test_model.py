@@ -70,9 +70,9 @@ def test_head_spec_canonicalization_alpha_and_diagnostics():
         with pytest.raises(ValueError): canonicalize_head_spec(invalid)
     with pytest.raises(ValueError, match="only for loop_ab2"):
         HeadStudyModel("native", 11, 32, head_spec=alpha_spec)
-    for unsupported in ("dw5",):
-        with pytest.raises(ValueError, match="not implemented"):
-            HeadStudyModel("loop_ab2", 11, 32, head_spec={"version": 1, "variant": unsupported, "class_inner": 96})
+    assert HeadStudyModel("loop_ab2", 11, 32,
+                          head_spec={"version": 1, "variant": "dw5", "class_inner": 96}).head_spec == {
+                              "version": 1, "variant": "dw5", "class_inner": 96}
 
     torch.set_num_threads(1)
     rng_before = torch.get_rng_state().clone()
@@ -84,6 +84,9 @@ def test_head_spec_canonicalization_alpha_and_diagnostics():
     features = [torch.randn(2, c, n, n) for c, n in ((64, 4), (128, 2), (256, 1))]
     base_out = baseline_model.forward_features(features)
     alpha_out = model.forward_features(features)
+    from head_sharing.profile import measure_conv_macs
+    alpha_macs = measure_conv_macs(model.detect, lambda: model.forward_features(features))
+    assert alpha_macs["conv_invocations"] == 44 and alpha_macs["conv_macs"] > 0
     for key in ("one2many", "one2one"):
         assert torch.equal(base_out[1][key]["boxes"], alpha_out[1][key]["boxes"])
         assert torch.equal(base_out[1][key]["scores"], alpha_out[1][key]["scores"])
@@ -96,11 +99,15 @@ def test_head_spec_canonicalization_alpha_and_diagnostics():
                for records in diagnostic.values())
     assert model.training == before_mode and torch.equal(torch.get_rng_state(), before_rng)
     assert all(torch.equal(v, model.state_dict()[k]) for k, v in before_state.items())
-    from head_sharing.train import optimizer_groups
+    from head_sharing.train import _native_criterion, optimizer_groups
+    criterion = _native_criterion(model, 2)
+    targets = {"batch_idx": torch.tensor([0.]), "cls": torch.tensor([[1.]]),
+               "bboxes": torch.tensor([[.5, .5, .2, .2]])}
+    native_loss, _ = criterion(alpha_out, targets)
+    assert torch.isfinite(native_loss).all() and native_loss.sum().item() > 0
     optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01)
     optimizer.zero_grad(set_to_none=True)
-    sum(output["boxes"].sum() + output["scores"].sum()
-        for output in (alpha_out[1]["one2many"], alpha_out[1]["one2one"])).backward()
+    native_loss.sum().backward()
     assert all(t.alpha.grad is not None and torch.isfinite(t.alpha.grad).all() for t in towers)
     assert all(p.grad is None for p in model.detector.model[:-1].parameters())
     assert all(id(t.alpha) in {id(p) for p in optimizer.param_groups[1]["params"]} for t in towers)
@@ -111,7 +118,7 @@ def test_head_spec_canonicalization_alpha_and_diagnostics():
 
 @pytest.mark.parametrize("variant", ("step_norm", "scale_gain"))
 def test_calibration_variants_expected_update_gradients_and_roundtrip(tmp_path, variant):
-    from head_sharing.train import optimizer_groups
+    from head_sharing.train import _native_criterion, optimizer_groups
     spec = {"version": 1, "variant": variant, "class_inner": 96}
     rng_before = torch.get_rng_state().clone()
     baseline = HeadStudyModel("loop_ab2", 11, 32).eval()
@@ -196,9 +203,15 @@ def test_calibration_variants_expected_update_gradients_and_roundtrip(tmp_path, 
                         "detect.cv2.0.norm_b.weight", "detect.cv2.0.norm_b.bias"))
         assert all(name.count("norm_a_steps") <= 1 and name.count("norm_b_steps") <= 1 for name in state_names)
     output = model.forward_features(features)
-    loss = sum(output[1][branch][key].square().mean()
-               for branch in ("one2many", "one2one") for key in ("boxes", "scores"))
-    loss.backward()
+    from head_sharing.profile import measure_conv_macs
+    actual_macs = measure_conv_macs(model.detect, lambda: model.forward_features(features))
+    assert actual_macs["conv_invocations"] == 44 and actual_macs["conv_macs"] > 0
+    criterion = _native_criterion(model, 2)
+    targets = {"batch_idx": torch.tensor([0.]), "cls": torch.tensor([[1.]]),
+               "bboxes": torch.tensor([[.5, .5, .2, .2]])}
+    loss, _ = criterion(output, targets)
+    assert torch.isfinite(loss).all() and loss.sum().item() > 0
+    loss.sum().backward()
     for tower in towers:
         calibrated = ([p for p in tower.norm_a_steps.parameters()] + [p for p in tower.norm_b_steps.parameters()]
                       if variant == "step_norm" else list(tower.gain_a) + list(tower.gain_b))
@@ -243,6 +256,199 @@ def test_calibration_variants_expected_update_gradients_and_roundtrip(tmp_path, 
     with pytest.raises(ValueError, match="head_spec"):
         load_resume(wrong, wrong_optimizer, resume)
     assert all(torch.equal(v, wrong.detect.state_dict()[k]) for k, v in before.items())
+
+
+def test_dw5_replaces_adapter_without_shifting_other_initialization(tmp_path):
+    baseline = HeadStudyModel("loop_ab2", 11, 32).eval()
+    rng_before = torch.get_rng_state().clone()
+    model = HeadStudyModel("loop_ab2", 11, 32,
+                           head_spec={"version": 1, "variant": "dw5", "class_inner": 96}).eval()
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    features = [torch.randn(2, c, n, n) for c, n in ((64, 4), (128, 2), (256, 1))]
+    expected = baseline.forward_features(features)
+    actual = model.forward_features(features)
+    initialized_towers = {
+        name: {key: value.detach().clone() for key, value in getattr(model.detect, name)[0].state_dict().items()}
+        for name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3")
+    }
+    for branch in ("one2many", "one2one"):
+        for key in ("boxes", "scores"):
+            assert torch.allclose(expected[1][branch][key], actual[1][branch][key], atol=1e-6, rtol=1e-6)
+    from head_sharing.profile import measure_conv_macs
+    baseline_macs = measure_conv_macs(baseline.detect, lambda: baseline.forward_features(features))
+    dw5_macs = measure_conv_macs(model.detect, lambda: model.forward_features(features))
+    assert dw5_macs["conv_invocations"] == baseline_macs["conv_invocations"] == 44
+    assert dw5_macs["conv_macs"] > baseline_macs["conv_macs"]
+
+    from head_sharing.train import _native_criterion, optimizer_groups
+    model.train()
+    prediction = model.forward_features(features)
+    criterion = _native_criterion(model, 2)
+    targets = {"batch_idx": torch.tensor([0.]), "cls": torch.tensor([[1.]]),
+               "bboxes": torch.tensor([[.5, .5, .2, .2]])}
+    loss, _ = criterion(prediction, targets)
+    assert torch.isfinite(loss).all() and loss.sum().item() > 0
+    optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01, momentum=.9)
+    optimizer.zero_grad(set_to_none=True)
+    loss.sum().backward()
+    assert model.detect.cv3[0].a.weight.grad is not None
+    assert torch.isfinite(model.detect.cv3[0].a.weight.grad).all()
+    assert all(parameter.grad is None for parameter in model.detector.model[:-1].parameters())
+    optimizer.step()
+    model.eval()
+
+    trunk = {k: v.detach().clone() for k, v in model.detector.state_dict().items()
+             if k.startswith("model.") and int(k.split(".")[1]) < 23}
+    artifact = {"state_dict": trunk, "schema_version": 1, "architecture": "yolo26n",
+                "upstream": "8.4.177", "excluded_head_index": 23}
+    spec = {"version": 1, "variant": "dw5", "class_inner": 96}
+    weights, config = tmp_path / "dw5.pt", tmp_path / "dw5.json"
+    save_checkpoint(model, weights, config, RECEIPT)
+    restored = load_checkpoint(weights, config, trunk_artifact=artifact, synthetic_trunk=True)
+    assert restored.head_spec == spec
+    updated_output = model.forward_features(features)
+    restored_output = restored.forward_features(features)
+    for branch in ("one2many", "one2one"):
+        for key in ("boxes", "scores"):
+            assert torch.equal(updated_output[1][branch][key], restored_output[1][branch][key])
+    resume = tmp_path / "dw5-resume.pt"
+    save_resume(model, optimizer, resume, epoch=0)
+    same_shape_wrong = HeadStudyModel("loop_ab2", 11, 32)
+    wrong_optimizer = torch.optim.SGD(optimizer_groups(same_shape_wrong, .0005), lr=.01, momentum=.9)
+    with pytest.raises(ValueError, match="head_spec"):
+        load_resume(same_shape_wrong, wrong_optimizer, resume)
+    for name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
+        old_tower = getattr(baseline.detect, name)[0]
+        initial_state = initialized_towers[name]
+        assert len(old_tower.adapters) == 3
+        for index, old_adapter in enumerate(old_tower.adapters):
+            old_dw, old_pw = old_adapter
+            new_dw = initial_state[f"adapters.{index}.0.weight"]
+            new_pw_weight = initial_state[f"adapters.{index}.1.weight"]
+            new_pw_bias = initial_state[f"adapters.{index}.1.bias"]
+            assert new_dw.shape[-2:] == (5, 5)
+            assert torch.equal(new_dw[:, :, 1:4, 1:4], old_dw.weight)
+            outer_ring = torch.ones((5, 5), dtype=torch.bool)
+            outer_ring[1:4, 1:4] = False
+            assert torch.count_nonzero(new_dw[:, :, outer_ring]) == 0
+            assert torch.equal(new_pw_weight, old_pw.weight) and torch.equal(new_pw_bias, old_pw.bias)
+        for key, value in old_tower.state_dict().items():
+            if not key.startswith("adapters."):
+                assert torch.equal(value, initial_state[key])
+
+    dw5 = model.detect.cv2[0].adapters[0][0]
+    with torch.no_grad():
+        dw5.weight.zero_()
+        dw5.weight[:, :, 0, 0] = 1
+    impulse = torch.zeros(1, 64, 5, 5)
+    impulse[:, :, 2, 2] = 1
+    response = dw5(impulse)
+    assert torch.equal(response[:, :, 4, 4], torch.ones(1, 64))
+    before_fuse = model.forward_features(features)
+    model.detect.fuse()
+    fused_output = model.forward_features(features)
+    assert torch.equal(before_fuse[0], fused_output[0])
+    assert torch.equal(before_fuse[1]["one2one"]["scores"], fused_output[1]["one2one"]["scores"])
+
+
+@pytest.mark.parametrize("variant", ("baseline", "learned_alpha", "step_norm", "scale_gain", "dw5"))
+def test_class_inner48_shapes_compatible_initialization_and_real_cost(variant):
+    from head_sharing.profile import measure_conv_macs
+    spec = {"version": 1, "variant": variant, "class_inner": 48}
+    baseline = HeadStudyModel("loop_ab2", 11, 32).eval()
+    model = HeadStudyModel("loop_ab2", 11, 32, head_spec=spec).eval()
+    assert model.head_spec == spec
+    for name in ("cv3", "one2one_cv3"):
+        tower = getattr(model.detect, name)[0]
+        baseline_tower = getattr(baseline.detect, name)[0]
+        assert tower.a.weight.shape == (48, 96, 1, 1)
+        assert tower.b.weight.shape == (96, 48, 1, 1)
+        norm_b = tower.norm_b_steps[0] if variant == "step_norm" else tower.norm_b
+        assert norm_b.normalized_shape == (48,)
+        if variant == "scale_gain":
+            assert all(gain.shape == (48,) for gain in tower.gain_b)
+            assert all(gain.shape == (96,) for gain in tower.gain_a)
+        assert all(torch.equal(tower.adapters[i][1].weight, baseline_tower.adapters[i][1].weight)
+                   for i in range(3))
+        assert torch.equal(tower.readout.weight, baseline_tower.readout.weight)
+        assert not any(isinstance(module, torch.nn.Conv2d) and module.in_channels == 96
+                       and module.out_channels == 96 and module is not tower.readout
+                       for module in tower.modules())
+    for name in ("cv2", "one2one_cv2"):
+        assert getattr(model.detect, name)[0].a.weight.shape == (24, 24, 1, 1)
+        assert getattr(model.detect, name)[0].b.weight.shape == (24, 24, 1, 1)
+
+    features = [torch.randn(2, c, n, n) for c, n in ((64, 4), (128, 2), (256, 1))]
+    baseline_output = baseline.forward_features(features)
+    output = model.forward_features(features)
+    assert output[1]["one2many"]["scores"].shape == baseline_output[1]["one2many"]["scores"].shape
+    baseline_macs = measure_conv_macs(baseline.detect, lambda: baseline.forward_features(features))
+    actual_macs = measure_conv_macs(model.detect, lambda: model.forward_features(features))
+    assert actual_macs["conv_invocations"] == baseline_macs["conv_invocations"] == 44
+    assert 0 < actual_macs["conv_macs"] < baseline_macs["conv_macs"]
+
+
+def test_inner48_native_loss_checkpoint_resume_and_fuse_parity(tmp_path):
+    from head_sharing.train import _native_criterion, optimizer_groups
+    spec = {"version": 1, "variant": "scale_gain", "class_inner": 48}
+    model = HeadStudyModel("loop_ab2", 11, 32, head_spec=spec)
+    features = [torch.randn(2, c, n, n) for c, n in ((64, 4), (128, 2), (256, 1))]
+    prediction = model.forward_features(features)
+    criterion = _native_criterion(model, 2)
+    targets = {"batch_idx": torch.tensor([0.]), "cls": torch.tensor([[1.]]),
+               "bboxes": torch.tensor([[.5, .5, .2, .2]])}
+    loss, _ = criterion(prediction, targets)
+    assert torch.isfinite(loss).all() and loss.sum().item() > 0
+    optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01, momentum=.9)
+    optimizer.zero_grad(set_to_none=True)
+    loss.sum().backward()
+    class_tower = model.detect.cv3[0]
+    assert class_tower.a.weight.grad is not None and torch.isfinite(class_tower.a.weight.grad).all()
+    assert all(parameter.grad is None for parameter in model.detector.model[:-1].parameters())
+    trunk_before = {name: value.detach().clone() for name, value in model.detector.model[:-1].state_dict().items()}
+    update_before = class_tower.a.weight.detach().clone()
+    optimizer.step()
+    assert not torch.equal(update_before, class_tower.a.weight)
+    assert all(torch.equal(value, model.detector.model[:-1].state_dict()[name])
+               for name, value in trunk_before.items())
+
+    model.eval()
+    retained = model.forward_features(features)
+    macs = __import__("head_sharing.profile", fromlist=["measure_conv_macs"]).measure_conv_macs(
+        model.detect, lambda: model.forward_features(features))
+    assert macs["conv_macs"] > 0 and macs["conv_invocations"] == 44
+    unfused = retained[0].clone()
+    model.detect.fuse()
+    fused = model.forward_features(features)
+    assert torch.equal(unfused, fused[0])
+    assert torch.equal(retained[1]["one2one"]["scores"], fused[1]["one2one"]["scores"])
+    with pytest.raises(RuntimeError, match="inference-only"):
+        model.train()
+
+    trunk = {k: v.detach().clone() for k, v in model.detector.state_dict().items()
+             if k.startswith("model.") and int(k.split(".")[1]) < 23}
+    artifact = {"state_dict": trunk, "schema_version": 1, "architecture": "yolo26n",
+                "upstream": "8.4.177", "excluded_head_index": 23}
+    # Fused models are inference-only; use an unfused fresh instance for persistence.
+    source = HeadStudyModel("loop_ab2", 11, 32, head_spec=spec).eval()
+    weights, config = tmp_path / "inner48.pt", tmp_path / "inner48.json"
+    save_checkpoint(source, weights, config, RECEIPT)
+    restored = load_checkpoint(weights, config, trunk_artifact=artifact, synthetic_trunk=True)
+    assert restored.head_spec == spec
+    expected = source.forward_features(features)
+    actual = restored.forward_features(features)
+    for branch in ("one2many", "one2one"):
+        for key in ("boxes", "scores"):
+            assert torch.equal(expected[1][branch][key], actual[1][branch][key])
+    resume_model = HeadStudyModel("loop_ab2", 11, 32, head_spec=spec)
+    resume_optimizer = torch.optim.SGD(optimizer_groups(resume_model, .0005), lr=.01, momentum=.9)
+    resume = tmp_path / "inner48-resume.pt"
+    save_resume(resume_model, resume_optimizer, resume, epoch=0)
+    wrong = HeadStudyModel("loop_ab2", 11, 32,
+                           head_spec={"version": 1, "variant": "scale_gain", "class_inner": 96})
+    wrong_optimizer = torch.optim.SGD(optimizer_groups(wrong, .0005), lr=.01, momentum=.9)
+    with pytest.raises(ValueError, match="head_spec"):
+        load_resume(wrong, wrong_optimizer, resume)
 
 
 def test_cli_help_is_available(capsys):
