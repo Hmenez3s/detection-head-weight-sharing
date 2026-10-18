@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -21,6 +22,7 @@ CONTINGENCY_SECONDS = 3_600
 EXTENDED_CAP_SECONDS = 172_800
 EXTENDED_FINAL_SECONDS = 21_600
 EXTENDED_CONTINGENCY_SECONDS = 10_800
+MAX_ACTIVE_JOBS_PER_UUID = 2
 MAX_CPUS = 12
 ACTIVE_STATUSES = {"reserved", "launching", "running", "active-unknown"}
 
@@ -155,6 +157,81 @@ class AllocationLedger:
         finally:
             self._thread_lock.release()
 
+    @staticmethod
+    def _base_caps():
+        return {"total_seconds": CAP_SECONDS,
+                "main_seconds": CAP_SECONDS-FINAL_SECONDS-CONTINGENCY_SECONDS,
+                "final_seconds": FINAL_SECONDS, "contingency_seconds": CONTINGENCY_SECONDS,
+                "max_active_jobs_per_uuid": 1}
+
+    @staticmethod
+    def _extended_caps():
+        return {"total_seconds": EXTENDED_CAP_SECONDS,
+                "main_seconds": EXTENDED_CAP_SECONDS-EXTENDED_FINAL_SECONDS-EXTENDED_CONTINGENCY_SECONDS,
+                "final_seconds": EXTENDED_FINAL_SECONDS,
+                "contingency_seconds": EXTENDED_CONTINGENCY_SECONDS,
+                "max_active_jobs_per_uuid": MAX_ACTIVE_JOBS_PER_UUID}
+
+    @staticmethod
+    def _valid_caps(caps):
+        keys = {"total_seconds", "main_seconds", "final_seconds", "contingency_seconds",
+                "max_active_jobs_per_uuid"}
+        return (isinstance(caps, dict) and set(caps) == keys and
+                all(type(caps[key]) is int and caps[key] >= 0 for key in keys) and
+                caps["total_seconds"] == caps["main_seconds"] + caps["final_seconds"] + caps["contingency_seconds"] and
+                caps["max_active_jobs_per_uuid"] in (1, MAX_ACTIVE_JOBS_PER_UUID))
+
+    @staticmethod
+    def _valid_balances(balances):
+        phases = {"main", "final", "contingency"}
+        return (isinstance(balances, dict) and set(balances) == set(GPU_UUIDS) and
+                all(isinstance(balances[device], dict) and set(balances[device]) == phases and
+                    all(type(value) is int and value >= 0 for value in balances[device].values())
+                    for device in GPU_UUIDS))
+
+    @classmethod
+    def _validate_policy_history(cls, policy, history):
+        if not isinstance(history, list):
+            raise RuntimeErrorSafe("invalid policy history")
+        if policy is None:
+            if history:
+                raise RuntimeErrorSafe("policy history exists without authorized policy")
+            return
+        if not history:
+            raise RuntimeErrorSafe("authorized policy has no history")
+        prior_caps = cls._base_caps()
+        for index, record in enumerate(history):
+            if not isinstance(record, dict):
+                raise RuntimeErrorSafe("invalid policy history")
+            before, after = record.get("before_caps"), record.get("after_caps")
+            before_balances, after_balances = record.get("before_balances"), record.get("after_balances")
+            authorization = record.get("authorization")
+            if (not cls._valid_caps(before) or not cls._valid_caps(after) or before != prior_caps or
+                    not cls._valid_balances(before_balances) or not cls._valid_balances(after_balances) or
+                    before_balances != after_balances or
+                    not isinstance(authorization, dict) or
+                    set(authorization) != {"reason", "evidence", *after.keys()} or
+                    not isinstance(authorization.get("reason"), str) or not authorization["reason"].strip() or
+                    not isinstance(authorization.get("evidence"), str) or not authorization["evidence"].strip() or
+                    {key: authorization.get(key) for key in after} != after or
+                    type(record.get("created")) not in (int, float) or
+                    (type(record.get("created")) is float and not math.isfinite(record["created"])) or
+                    record["created"] < 0):
+                raise RuntimeErrorSafe("invalid or unauthorised ledger policy history")
+            if index == 0:
+                if after != cls._extended_caps():
+                    raise RuntimeErrorSafe("invalid historical budget extension")
+            elif (before["max_active_jobs_per_uuid"] != MAX_ACTIVE_JOBS_PER_UUID or
+                  after["max_active_jobs_per_uuid"] != MAX_ACTIVE_JOBS_PER_UUID or
+                  any(after[key] < before[key] for key in
+                      ("total_seconds", "main_seconds", "final_seconds", "contingency_seconds")) or
+                  not any(after[key] > before[key] for key in
+                          ("total_seconds", "main_seconds", "final_seconds", "contingency_seconds"))):
+                raise RuntimeErrorSafe("budget amendment must be monotonic and increase a cap")
+            prior_caps = after
+        if policy != prior_caps:
+            raise RuntimeErrorSafe("effective policy does not match authorization history")
+
     def _load(self):
         try:
             state = json.loads((self.root / "ledger.json").read_text(encoding="utf-8"))
@@ -162,64 +239,64 @@ class AllocationLedger:
             raise RuntimeErrorSafe("ledger unreadable; refusing allocation") from exc
         if state.get("version") != 1 or set(state.get("devices", {})) != set(GPU_UUIDS):
             raise RuntimeErrorSafe("ledger UUID/config mismatch")
-        policy = state.get("policy")
-        history = state.get("policy_history", [])
-        if policy is None:
-            if not isinstance(history, list) or history:
-                raise RuntimeErrorSafe("policy history exists without authorized policy")
-        else:
-            expected = {"total_seconds": EXTENDED_CAP_SECONDS, "main_seconds": 140_400,
-                        "final_seconds": EXTENDED_FINAL_SECONDS, "contingency_seconds": EXTENDED_CONTINGENCY_SECONDS,
-                        "max_active_jobs_per_uuid": 2}
-            record = history[-1] if isinstance(history, list) and history else None
-            authorization = record.get("authorization") if isinstance(record, dict) else None
-            if (policy != expected or not isinstance(record, dict) or record.get("after_caps") != policy or
-                    not isinstance(authorization, dict) or
-                    not isinstance(authorization.get("reason"), str) or not authorization["reason"].strip() or
-                    not isinstance(authorization.get("evidence"), str) or not authorization["evidence"].strip() or
-                    {key: authorization.get(key) for key in expected} != expected):
-                raise RuntimeErrorSafe("invalid or unauthorised ledger policy metadata")
+        self._validate_policy_history(state.get("policy"), state.get("policy_history", []))
         return state
 
     def authorize_extension(self, *, reason: str, evidence: str) -> bool:
-        """Explicitly enable the approved cumulative budget and two-job policy.
-
-        Returns False for an identical replay; prior charges, jobs, and history
-        are preserved under the same cooperative mutex as reservations.
-        """
+        """Apply the historical first extension, idempotent even after amendments."""
         if not isinstance(reason, str) or not reason.strip() or not isinstance(evidence, str) or not evidence.strip():
             raise RuntimeErrorSafe("authorization reason and evidence are required")
-        authorization = {"reason": reason.strip(), "evidence": evidence.strip(),
-                         "total_seconds": EXTENDED_CAP_SECONDS,
-                         "main_seconds": EXTENDED_CAP_SECONDS-EXTENDED_FINAL_SECONDS-EXTENDED_CONTINGENCY_SECONDS,
-                         "final_seconds": EXTENDED_FINAL_SECONDS,
-                         "contingency_seconds": EXTENDED_CONTINGENCY_SECONDS,
-                         "max_active_jobs_per_uuid": 2}
+        authorization = {"reason": reason.strip(), "evidence": evidence.strip(), **self._extended_caps()}
         with self._locked():
             state = self._load()
             history = state.get("policy_history", [])
-            if not isinstance(history, list):
-                raise RuntimeErrorSafe("invalid policy history")
-            for entry in history:
-                if not isinstance(entry, dict) or not isinstance(entry.get("authorization"), dict):
-                    raise RuntimeErrorSafe("invalid policy history")
             if state.get("policy") is not None:
-                policy = state["policy"]
-                if policy != {key: value for key, value in authorization.items() if key not in ("reason", "evidence")}:
-                    raise RuntimeErrorSafe("unsupported or malformed ledger policy")
-                if history and history[-1].get("authorization") == authorization:
+                if history[0]["authorization"] == authorization:
                     return False
-                # An already enabled policy cannot be replaced or re-authorized.
                 raise RuntimeErrorSafe("policy is already authorized; refusing policy mutation")
             before = {u: {k: state["devices"][u][k] for k in ("main", "final", "contingency")} for u in GPU_UUIDS}
-            before_caps = {"total_seconds": CAP_SECONDS, "main_seconds": CAP_SECONDS-FINAL_SECONDS-CONTINGENCY_SECONDS,
-                           "final_seconds": FINAL_SECONDS, "contingency_seconds": CONTINGENCY_SECONDS,
-                           "max_active_jobs_per_uuid": 1}
-            after_caps = {key: value for key, value in authorization.items() if key not in ("reason", "evidence")}
+            after_caps = self._extended_caps()
             state["policy"] = after_caps
             state.setdefault("policy_history", []).append({"authorization": authorization,
-                "before_caps": before_caps, "after_caps": after_caps, "before_balances": before,
+                "before_caps": self._base_caps(), "after_caps": after_caps, "before_balances": before,
                 "after_balances": {u: dict(before[u]) for u in GPU_UUIDS}, "created": self.clock()})
+            _atomic_json(self.root / "ledger.json", state)
+            return True
+
+    def authorize_amendment(self, *, total_seconds: int, main_seconds: int, final_seconds: int,
+                            contingency_seconds: int, reason: str, evidence: str) -> bool:
+        """Append a finite, monotonic budget tranche without changing old debits."""
+        caps = {"total_seconds": total_seconds, "main_seconds": main_seconds,
+                "final_seconds": final_seconds, "contingency_seconds": contingency_seconds,
+                "max_active_jobs_per_uuid": MAX_ACTIVE_JOBS_PER_UUID}
+        if (not self._valid_caps(caps) or not isinstance(reason, str) or not reason.strip() or
+                not isinstance(evidence, str) or not evidence.strip()):
+            raise RuntimeErrorSafe("finite integer caps, reason, and evidence are required")
+        authorization = {"reason": reason.strip(), "evidence": evidence.strip(), **caps}
+        with self._locked():
+            state = self._load()
+            history = state.get("policy_history", [])
+            if state.get("policy") is None:
+                raise RuntimeErrorSafe("apply the historical extension before a budget amendment")
+            if any(record["authorization"] == authorization for record in history):
+                return False
+            before_caps = state["policy"]
+            if (any(caps[key] < before_caps[key] for key in
+                    ("total_seconds", "main_seconds", "final_seconds", "contingency_seconds")) or
+                    not any(caps[key] > before_caps[key] for key in
+                            ("total_seconds", "main_seconds", "final_seconds", "contingency_seconds"))):
+                raise RuntimeErrorSafe("budget amendment must be monotonic and increase a cap")
+            if any(job["status"] in ACTIVE_STATUSES for device in state["devices"].values()
+                   for job in device["jobs"]):
+                raise RuntimeErrorSafe("active reservations block budget amendment")
+            balances = {u: {k: state["devices"][u][k] for k in ("main", "final", "contingency")}
+                        for u in GPU_UUIDS}
+            state["policy"] = caps
+            history.append({"authorization": authorization, "before_caps": before_caps,
+                            "after_caps": caps, "before_balances": balances,
+                            "after_balances": {u: dict(balances[u]) for u in GPU_UUIDS},
+                            "created": self.clock()})
+            state["policy_history"] = history
             _atomic_json(self.root / "ledger.json", state)
             return True
 
@@ -237,11 +314,6 @@ class AllocationLedger:
             max_slots = 1
             limits = {"main": CAP_SECONDS-FINAL_SECONDS-CONTINGENCY_SECONDS, "final": FINAL_SECONDS, "contingency": CONTINGENCY_SECONDS}
             if policy is not None:
-                expected = {"total_seconds": EXTENDED_CAP_SECONDS, "main_seconds": 140_400,
-                            "final_seconds": EXTENDED_FINAL_SECONDS, "contingency_seconds": EXTENDED_CONTINGENCY_SECONDS,
-                            "max_active_jobs_per_uuid": 2}
-                if policy != expected:
-                    raise RuntimeErrorSafe("unsupported or malformed ledger policy")
                 limits = {"main": policy["main_seconds"], "final": policy["final_seconds"],
                           "contingency": policy["contingency_seconds"]}
                 max_slots = policy["max_active_jobs_per_uuid"]
@@ -394,8 +466,15 @@ def main(argv=None) -> int:
     reserve.add_argument("--seconds", type=int, required=True); reserve.add_argument("--phase", choices=("main", "final", "contingency"), required=True)
     reserve.add_argument("--cpus", type=int, default=6)
     reserve.add_argument("--peak-memory-bytes", type=int)
-    extend = sub.add_parser("authorize-extension", help="append explicit cumulative-budget authorization")
+    extend = sub.add_parser("authorize-extension", help="apply the historical first cumulative-budget extension")
     extend.add_argument("--root", required=True); extend.add_argument("--reason", required=True); extend.add_argument("--evidence", required=True)
+    amend = sub.add_parser("authorize-amendment", help="append a finite cumulative-budget amendment")
+    amend.add_argument("--root", required=True)
+    amend.add_argument("--total-seconds", type=int, required=True)
+    amend.add_argument("--main-seconds", type=int, required=True)
+    amend.add_argument("--final-seconds", type=int, required=True)
+    amend.add_argument("--contingency-seconds", type=int, required=True)
+    amend.add_argument("--reason", required=True); amend.add_argument("--evidence", required=True)
     args = parser.parse_args(argv)
     if args.action == "init":
         initialize(args.owned_study_root, args.subroot); return 0
@@ -403,15 +482,18 @@ def main(argv=None) -> int:
     if args.action == "authorize-extension":
         print("authorized" if ledger.authorize_extension(reason=args.reason, evidence=args.evidence) else "already-authorized")
         return 0
+    if args.action == "authorize-amendment":
+        applied = ledger.authorize_amendment(total_seconds=args.total_seconds, main_seconds=args.main_seconds,
+            final_seconds=args.final_seconds, contingency_seconds=args.contingency_seconds,
+            reason=args.reason, evidence=args.evidence)
+        print("authorized" if applied else "already-authorized")
+        return 0
     if args.action == "status":
         with ledger._locked():
             state = ledger._load()
         public = {device_uuid: {"main": device["main"], "final": device["final"],
                                 "contingency": device["contingency"],
-                                "effective_policy": state.get("policy", {"total_seconds": CAP_SECONDS,
-                                    "main_seconds": CAP_SECONDS-FINAL_SECONDS-CONTINGENCY_SECONDS,
-                                    "final_seconds": FINAL_SECONDS, "contingency_seconds": CONTINGENCY_SECONDS,
-                                    "max_active_jobs_per_uuid": 1}),
+                                "effective_policy": state.get("policy", AllocationLedger._base_caps()),
                                 "jobs": [{key: job.get(key) for key in ("id", "phase", "seconds", "cpus", "status", "pid", "started", "ended", "exit_code", "progress")}
                                          for job in device["jobs"]]}
                   for device_uuid, device in state["devices"].items()}
