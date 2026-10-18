@@ -104,7 +104,7 @@ def test_sealed_json_hash_and_report_are_honest(tmp_path):
     assert "development-only" in report
     assert "does not contain a complete n=3 candidate group" in report
     assert "All candidates used one frozen trunk; DEV data were reused" in report
-    assert "COCO evaluation was not performed" in report
+    assert "No new COCO val2017 holdout evaluation was performed" in report
     assert "80-epoch baseline" in report
     assert "Separate exploratory class_inner48 cost-stage result" in report
     assert f"{operator.BASELINE11_AP:.17f}" in report

@@ -347,7 +347,7 @@ def render_dev_report(study, decision):
         study_qualification = (f"This report contains the five-arm seed11 adaptive screen and {len(confirmations)} "
                                "closed winner follow-up(s); it does not contain a complete n=3 candidate group.")
     lines = ["# AB2 refinement — development-only report", "", study_qualification,
-             "No significance or held-out improvement claim is made. COCO evaluation was not performed. "
+             "No significance or held-out improvement claim is made. No new COCO val2017 holdout evaluation was performed. "
              "All candidates used one frozen trunk; DEV data were reused for adaptive selection.",
              "", f"Top seed11 screen result: {decision['winner']} at {decision['winner_dose']} epochs "
              f"(raw DEV AP50:95 {decision['winner_dev_ap']:.8f}); admitted candidate: "
