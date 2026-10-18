@@ -259,3 +259,86 @@ def test_module_is_native_runtime_free_at_import():
     source = (ROOT / ".internal" / "ab2_refinement.py").read_text()
     assert "import torch" not in source and "from torch" not in source
     assert "subprocess" not in source and "socket" not in source
+
+
+def _failed(variant, done=3, **changes):
+    dose = 80 if variant == "baseline80" else 40
+    row = _screen(variant, .0, 1) | {
+        "status": "failed", "dev_ap": None, "probe_ap": None, "epochs": dose, "epochs_completed": done,
+        "failure_reason": "synthetic divergence", "failure_evidence": {"path": "x/failure.json", "sha256": "d" * 64}}
+    del row["conv_macs"], row["selected_epoch"], row["training"]
+    return row | changes
+
+
+def test_failed_conditions_are_ineligible_and_reported_without_a_fake_score():
+    rows = [_screen("baseline80", .16, 700), _failed("learned_alpha"), _screen("step_norm", .18, 500),
+            _screen("scale_gain", .15, 400), _failed("dw5", done=0)]
+    decision = operator.decide_stages(rows)
+    assert decision["winner"] == "step_norm" and decision["selected_variant"] == "step_norm"
+    assert [x["variant"] for x in decision["failed_conditions"]] == ["learned_alpha", "dw5"]
+    assert decision["failed_conditions"][1]["epochs_completed"] == 0
+    report = operator.render_dev_report({"screens": rows}, decision)
+    assert "FAILED after 3 completed epoch(s)" in report and "no admissible full-dose DEV score" in report
+    assert "synthetic divergence" in report and "d" * 64 in report
+    assert "learned_alpha / seed 11 / 40 epochs: DEV AP" not in report and "None" not in report
+    assert "learned_alpha / 40 epochs / n=" not in report
+    confirms = [{"variant": "step_norm", "head_spec": rows[2]["head_spec"], "seed": seed, "epochs": 40,
+                 "closed": True, "dev_ap": .17} for seed in (33, 55)]
+    assert operator.decide_stages(rows, confirms=confirms)["confirmation_mean_dev_ap"] is not None
+    for bad in (confirms[0] | {"dev_ap": None, "status": "failed"}, confirms[0] | {"status": "failed"},
+                confirms[0] | {"dev_ap": float("nan")}):
+        with pytest.raises(ValueError, match="single-winner"):
+            operator.decide_stages(rows, confirms=[bad])
+
+
+def test_all_failed_is_a_truthful_no_winner_outcome_with_partial_curve_not_ranked():
+    rows = [_failed(name, done=i, history=[{"epoch": 1, "dev": {"AP50:95": .9}, "probe": {"AP50:95": float("nan")}}])
+            for i, name in enumerate(operator.VARIANTS)]
+    decision = operator.decide_stages(rows)
+    assert decision["winner"] is None and decision["winner_dose"] is None and decision["winner_dev_ap"] is None
+    assert decision["selected_variant"] is None and decision["permitted_confirmations"] == []
+    assert not decision["cost_admitted"] and any("no completed" in skip for skip in decision["skips"])
+    assert any(skip.startswith("confirmation:") for skip in decision["skips"])
+    with pytest.raises(ValueError, match="prohibited"):
+        operator.decide_stages(rows, confirms=[{"variant": "dw5", "seed": 33}])
+    report = operator.render_dev_report({"screens": rows}, decision)
+    assert "no winner" in report and "could not be assessed" in report and "INCOMPLETE partial curve" in report
+    assert "not ranked" in report and "None" not in report and "nan" not in report.lower()
+
+
+def test_malformed_failures_partial_ap_and_incomplete_projection_are_rejected():
+    base = [_screen("baseline80", .16, 700), _screen("learned_alpha", .15, 1), _screen("step_norm", .14, 2),
+            _screen("scale_gain", .13, 3), _failed("dw5")]
+    assert operator.decide_stages(base)["winner"] == "baseline80"
+    bad_changes = [{"dev_ap": 0.0}, {"dev_ap": .05}, {"probe_ap": .05}, {"failure_reason": " "},
+                   {"failure_reason": None}, {"failure_evidence": {"path": "p"}},
+                   {"failure_evidence": {"path": "", "sha256": "d" * 64}},
+                   {"failure_evidence": {"path": "p", "sha256": "D" * 64}},
+                   {"failure_evidence": {"path": "p", "sha256": "d" * 64, "x": 1}},
+                   {"epochs_completed": 40}, {"epochs_completed": -1}, {"epochs_completed": True},
+                   {"epochs_completed": 1.0}, {"seed": 33}, {"closed": False}, {"status": "running"},
+                   {"head_spec": {"version": 1, "variant": "dw5", "class_inner": 48}}]
+    for change in bad_changes:
+        rows = base[:4] + [_failed("dw5", **change)]
+        with pytest.raises(ValueError):
+            operator.decide_stages(rows)
+    with pytest.raises(ValueError, match="status"):
+        operator.decide_stages(base[:4] + [base[4] | {"status": "missing"}])
+    with pytest.raises(ValueError, match="status"):
+        operator.decide_stages(base[:3] + [base[3] | {"status": None}] + base[4:])
+    with pytest.raises(ValueError, match="five"):
+        operator.decide_stages(base[:4])
+    with pytest.raises(ValueError, match="closed"):
+        operator.decide_stages(base[:4] + [_failed("dw5") | {"closed": False}])
+    with pytest.raises(ValueError, match="AP"):
+        operator.decide_stages(base[:4] + [_screen("dw5", .1, 1) | {"dev_ap": None}])
+    decision = operator.decide_stages(base)
+    with pytest.raises(ValueError, match="partial AP"):
+        operator.render_dev_report({"screens": base[:4] + [_failed("dw5", dev_ap=.01)]}, decision)
+    with pytest.raises(ValueError, match="failed condition cannot be the decision winner"):
+        operator.render_dev_report({"screens": base}, decision | {"winner": "dw5"})
+    with pytest.raises(ValueError, match="failed or partial-dose"):
+        operator.decide_stages(base[:4] + [base[4] | {"status": "completed", "dev_ap": .12, "conv_macs": 4}])
+    for done in (3, True, 40.0):
+        with pytest.raises(ValueError, match="partial-dose"):
+            operator.decide_stages(base[:3] + [base[3] | {"epochs_completed": done}] + base[4:])

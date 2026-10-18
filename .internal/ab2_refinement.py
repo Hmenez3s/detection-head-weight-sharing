@@ -195,6 +195,10 @@ def _metric(history, epoch, block, metric):
     return value.get(metric) if isinstance(value, dict) else None
 
 
+def _finite_or_none(value):
+    return value if type(value) in (int, float) and math.isfinite(value) else None
+
+
 def attach_head_conv_macs(row, head_conv_macs):
     """Attach a parent's CPU-executed B1/512 retained-dual head MAC count."""
     if not isinstance(row, dict) or row.get("closed") is not True:
@@ -231,6 +235,41 @@ def attach_profile(row, *, conv_macs, profile):
     return result
 
 
+def _is_failed(row):
+    return isinstance(row, dict) and row.get("status") == "failed"
+
+
+def _check_failed_condition(row, dose):
+    """Structure-only check of a parent-sealed failed MAIN condition; performs no I/O.
+
+    A failed condition never carries a DEV score (not even a partial one), so it can
+    neither rank nor feed a mean/confirmation/cost stage.
+    """
+    if row.get("closed") is not True or type(dose) is not int:
+        raise ValueError("failed screen must be closed with an integer target dose")
+    if (row.get("dev_ap") is not None or row.get("probe_ap") is not None or
+            row.get("selected_dev_ap") is not None):
+        raise ValueError("failed screen cannot carry a DEV/PROBE AP; partial AP is not a full-dose score")
+    reason = row.get("failure_reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("failed screen requires a nonempty failure_reason")
+    evidence = row.get("failure_evidence")
+    if (not isinstance(evidence, dict) or set(evidence) != {"path", "sha256"} or
+            not isinstance(evidence["path"], str) or not evidence["path"] or not _is_sha(evidence["sha256"])):
+        raise ValueError("failed screen requires failure_evidence with path and lowercase SHA256")
+    done = row.get("epochs_completed")
+    if type(done) is not int or not 0 <= done < dose:
+        raise ValueError("failed screen epochs_completed must be an int below the target dose")
+    if row.get("seed") != 11 or type(row.get("seed")) is not int:
+        raise ValueError("failed screen requires seed 11")
+
+
+def _failure_summary(row):
+    return {"variant": row["variant"], "epochs": row["epochs"], "seed": row["seed"],
+            "epochs_completed": row["epochs_completed"], "failure_reason": row["failure_reason"],
+            "failure_evidence": dict(row["failure_evidence"])}
+
+
 def decide_stages(screens, *, baseline40_ap=BASELINE11_AP, confirms=(), fresh_main_seconds=None,
                   required_margin_seconds=None, baseline40_mean=None, cost_seed_seconds=5400):
     """Choose one closed screen winner; admit only its confirmation/cost stages."""
@@ -253,6 +292,17 @@ def decide_stages(screens, *, baseline40_ap=BASELINE11_AP, confirms=(), fresh_ma
             raise ValueError("screen head_spec is not canonical") from exc
         if row.get("head_spec") != expected_spec or canonical_spec != expected_spec:
             raise ValueError("screen head_spec does not match its registered variant/dose")
+        status = row.get("status", "completed")
+        if status not in ("completed", "failed"):
+            raise ValueError("screen status must be completed or failed")
+        if status == "failed":
+            _check_failed_condition(row, dose)
+            by_variant[variant] = row
+            continue
+        if ("failure_reason" in row or "failure_evidence" in row or
+                ("epochs_completed" in row and
+                 (type(row["epochs_completed"]) is not int or row["epochs_completed"] != dose))):
+            raise ValueError("completed screen cannot carry failed or partial-dose evidence")
         if (type(row.get("seed")) is not int or row["seed"] != 11 or
                 type(row.get("dev_ap")) not in (int, float) or not math.isfinite(row["dev_ap"]) or
                 not 0 <= row["dev_ap"] <= 1):
@@ -262,14 +312,20 @@ def decide_stages(screens, *, baseline40_ap=BASELINE11_AP, confirms=(), fresh_ma
         by_variant[variant] = row
     if set(by_variant) != set(VARIANTS):
         raise ValueError("all four primary40 and baseline80 screens are required")
-    primary = [by_variant[name] for name in VARIANT_ORDER[1:]]
-    winner = min(primary + [by_variant["baseline80"]],
-                 key=lambda row: (-row["dev_ap"], row["conv_macs"], VARIANT_ORDER.index(row["variant"])))
-    improves = winner["dev_ap"] > baseline40_ap
+    failed = [_failure_summary(by_variant[name]) for name in VARIANT_ORDER if _is_failed(by_variant[name])]
+    eligible = [by_variant[name] for name in VARIANT_ORDER if not _is_failed(by_variant[name])]
+    # Only complete conditions rank; failed ones never get a substitute score.
+    winner = min(eligible, key=lambda row: (-row["dev_ap"], row["conv_macs"], VARIANT_ORDER.index(row["variant"]))
+                 ) if eligible else None
+    improves = winner is not None and winner["dev_ap"] > baseline40_ap
     selected = winner["variant"] if improves else None
     permitted_confirms = []
     skipped = []
-    if selected is None:
+    if winner is None:
+        skipped.extend(["screen: no completed full-dose condition is eligible to rank",
+                        "confirmation: no admissible full-dose seed-11 DEV winner",
+                        "cost: no quality winner"])
+    elif selected is None:
         skipped.extend(["confirmation: no strict seed-11 DEV improvement over raw baseline40",
                         "cost: no quality winner"])
     else:
@@ -296,6 +352,7 @@ def decide_stages(screens, *, baseline40_ap=BASELINE11_AP, confirms=(), fresh_ma
         for row in confirmations:
             key = f"{row.get('variant')}:seed{row.get('seed')}"
             if (key not in allowed or row.get("closed") is not True or
+                    row.get("status", "completed") != "completed" or  # strict complete-only follow-ups
                     type(row.get("seed")) is not int or row.get("epochs") != winner["epochs"] or
                     row.get("head_spec") != winner["head_spec"] or
                     canonicalize_head_spec(row.get("head_spec")) != winner["head_spec"] or
@@ -323,7 +380,8 @@ def decide_stages(screens, *, baseline40_ap=BASELINE11_AP, confirms=(), fresh_ma
         type(required_margin_seconds) in (int, float) and fresh_main_seconds >= cost_seed_seconds + required_margin_seconds
     if selected is not None and winner["epochs"] == 40 and not cost and not any(x.startswith("cost:") for x in skipped):
         skipped.append("cost: stage not admitted")
-    return {"winner": winner["variant"], "winner_dose": winner["epochs"], "winner_dev_ap": winner["dev_ap"],
+    return {"winner": winner and winner["variant"], "winner_dose": winner and winner["epochs"],
+            "winner_dev_ap": winner and winner["dev_ap"], "failed_conditions": failed,
             "improves_baseline40_seed11": improves, "selected_variant": selected,
             "permitted_confirmations": permitted_confirms, "confirmations": confirmations,
             "confirmation_mean_dev_ap": mean, "cost_admitted": bool(cost), "skips": skipped,
@@ -334,9 +392,23 @@ def render_dev_report(study, decision):
     """Render a candid English-only development report from parent-supplied observations."""
     if not isinstance(study, dict) or not isinstance(decision, dict):
         raise ValueError("report inputs must be objects")
-    screens = study.get("screens", [])
-    if len(screens) != 5 or any(row.get("closed") is not True for row in screens):
+    all_screens = study.get("screens", [])
+    if len(all_screens) != 5 or any(not isinstance(row, dict) or row.get("closed") is not True
+                                    for row in all_screens):
         raise ValueError("report requires all five closed screens")
+    failed_rows = []
+    for row in all_screens:
+        status = row.get("status", "completed")
+        if status not in ("completed", "failed"):
+            raise ValueError("screen status must be completed or failed")
+        if status == "failed":
+            if row.get("variant") not in VARIANTS:
+                raise ValueError("failed screen variant is invalid")
+            _check_failed_condition(row, row.get("epochs"))
+            failed_rows.append(row)
+    if decision.get("winner") in {row["variant"] for row in failed_rows}:
+        raise ValueError("a failed condition cannot be the decision winner")
+    screens = [row for row in all_screens if not _is_failed(row)]  # only completed rows have a score
     confirmations = list(decision.get("confirmations", []))
     complete_followups = ({row.get("seed") for row in confirmations} == {33, 55} and
                           decision.get("selected_variant") is not None)
@@ -346,19 +418,37 @@ def render_dev_report(study, decision):
     else:
         study_qualification = (f"This report contains the five-arm seed11 adaptive screen and {len(confirmations)} "
                                "closed winner follow-up(s); it does not contain a complete n=3 candidate group.")
+    if failed_rows:
+        study_qualification += (f" {len(failed_rows)} of the five MAIN screen conditions failed before reaching the "
+                                "full dose; they have no admissible full-dose DEV score and are not ranked.")
+    if decision.get("winner") is None:
+        top = ("No completed full-dose seed11 screen condition exists, so there is no winner, no admitted candidate, "
+               "and no admissible DEV score to compare with baseline40.")
+    else:
+        top = (f"Top seed11 screen result: {decision['winner']} at {decision['winner_dose']} epochs "
+               f"(raw DEV AP50:95 {decision['winner_dev_ap']:.8f}); admitted candidate: "
+               f"{decision.get('selected_variant') or 'none'}.")
     lines = ["# AB2 refinement — development-only report", "", study_qualification,
              "No significance or held-out improvement claim is made. No new COCO val2017 holdout evaluation was performed. "
              "All candidates used one frozen trunk; DEV data were reused for adaptive selection.",
-             "", f"Top seed11 screen result: {decision['winner']} at {decision['winner_dose']} epochs "
-             f"(raw DEV AP50:95 {decision['winner_dev_ap']:.8f}); admitted candidate: "
-             f"{decision.get('selected_variant') or 'none'}.",
+             "", top,
              "The 80-epoch baseline is a distinct dose family and cannot isolate an architecture effect from training duration.", "",
              "## Seed-level development and probe results"]
     for row in screens + list(decision.get("confirmations", [])):
         probe = row.get("probe_ap")
         lines.append(f"- {row['variant']} / seed {row['seed']} / {row['epochs']} epochs: DEV AP50:95 {row['dev_ap']:.8f}; PROBE AP50:95 {probe if probe is not None else 'not reported'}; selected epoch {row.get('selected_epoch', 'unknown')}; training SHA256 {row.get('training', {}).get('sha256', 'not supplied')}.")
+    if failed_rows:
+        lines.extend(["", "## Failed MAIN conditions (no admissible full-dose DEV score)"])
+        for row in failed_rows:
+            ref = row["failure_evidence"]
+            lines.append(f"- {row['variant']} / seed {row['seed']} / target {row['epochs']} epochs: FAILED after "
+                         f"{row['epochs_completed']} completed epoch(s); no admissible full-dose DEV score; "
+                         f"reason: {row['failure_reason']}; sealed failure reference: {ref['path']} (SHA256 {ref['sha256']}).")
     lines.extend(["", "## Selection and stages"])
-    lines.append(f"Strict improvement over raw seed-11 baseline40 DEV AP {BASELINE11_AP:.17f} was " + ("observed." if decision["improves_baseline40_seed11"] else "not observed; no adaptive follow-ups were admitted."))
+    if decision.get("winner") is None:
+        lines.append("Strict improvement over raw seed-11 baseline40 could not be assessed: no condition has an admissible full-dose DEV score; no adaptive follow-ups were admitted.")
+    else:
+        lines.append(f"Strict improvement over raw seed-11 baseline40 DEV AP {BASELINE11_AP:.17f} was " + ("observed." if decision["improves_baseline40_seed11"] else "not observed; no adaptive follow-ups were admitted."))
     lines.append("The admitted candidate is a single adaptively chosen trunk variant; this does not show that sharing caused a gain." if decision.get("selected_variant") is not None else "No candidate was admitted by the strict-improvement rule; this screen cannot establish a sharing benefit.")
     lines.append("Cost-stage admission: " + ("admitted under the supplied fresh-MAIN budget and explicit margin." if decision["cost_admitted"] else "skipped or not admitted; cost results are not combined with the quality comparison."))
     lines.append("Skips: " + ("; ".join(decision.get("skips", [])) if decision.get("skips") else "none"))
@@ -383,6 +473,17 @@ def render_dev_report(study, decision):
                         else None)}
                    for index, item in enumerate(history)]
         lines.append(f"- {row['variant']} / seed {row['seed']} curve: " + json.dumps(compact, allow_nan=False))
+    for row in failed_rows:
+        history = row.get("history")
+        if history is None:
+            continue
+        if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+            raise ValueError("failed screen history must be a list of epoch objects")
+        partial = [{"epoch": item.get("epoch"), "dev_ap": _finite_or_none(_metric(history, i + 1, "dev", "AP50:95")),
+                    "probe_ap": _finite_or_none(_metric(history, i + 1, "probe", "AP50:95"))}
+                   for i, item in enumerate(history)]
+        lines.append(f"- {row['variant']} / seed {row['seed']} INCOMPLETE partial curve (failed before epoch "
+                     f"{row['epochs']}; not ranked, not a full-dose DEV score): " + json.dumps(partial, allow_nan=False))
     if "cost" in study:
         lines.extend(["", "## Separate exploratory class_inner48 cost-stage result",
                       "This seed11 efficiency check is reported separately and is not combined with the quality comparison.",
