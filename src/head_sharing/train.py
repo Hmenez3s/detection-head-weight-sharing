@@ -50,7 +50,8 @@ def _native_criterion(model, epochs: int):
 def train(model, batches, *, epochs: int, seed: int, lr: float = .01,
           momentum: float = .9, weight_decay: float = .0005, start_epoch: int = 0,
           optimizer=None, criterion=None, device: str | torch.device = "cpu", progress=None, stop_epoch: int | None = None,
-          batch_progress=None, restored_rng: bool = False):
+          batch_progress=None, restored_rng: bool = False, finite_diagnostics=False,
+          diagnostic_context=None):
     """Train on an iterable factory yielding (Q-features or images, batch-targets)."""
     import torch
     if epochs < 1 or not 0 <= start_epoch <= epochs: raise ValueError("invalid fixed epoch range")
@@ -70,6 +71,19 @@ def train(model, batches, *, epochs: int, seed: int, lr: float = .01,
     if not start_epoch <= stop <= epochs: raise ValueError("stop epoch is outside fixed target")
     total_steps = max(1, epochs * max(1, getattr(batches, "steps", 1)))
     step = start_epoch * max(1, getattr(batches, "steps", 1)); losses=[]; state=[]
+
+    def fail_nonfinite(kind, loss_value=None):
+        context = dict(diagnostic_context or {})
+        context.update(epoch=epoch + 1, step=step + 1, phase="backward" if kind == "non_finite_gradient_norm" else "loss",
+                       failure_kind=kind)
+        path = Path(context.pop("failure_path")) if context.get("failure_path") else None
+        if loss_value is not None:
+            value = float(loss_value)
+            context["loss"] = value if math.isfinite(value) else "non-finite"
+        error = FloatingPointError(json.dumps(context, sort_keys=True, allow_nan=False))
+        if path is not None:
+            path.write_text(json.dumps(context, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+        raise error
     for epoch in range(start_epoch, stop):
         model.train(); epoch_losses=[]
         for inputs, batch in batches(epoch):
@@ -89,12 +103,22 @@ def train(model, batches, *, epochs: int, seed: int, lr: float = .01,
             # BF16 autocast policy as Detect while BCE's own policy promotes FP32.
             with torch.autocast(device_type=torch.device(device).type, dtype=torch.bfloat16, enabled=torch.device(device).type == "cuda"):
                 loss, _ = criterion(predictions, batch)
-            if not torch.isfinite(loss).all(): raise FloatingPointError("non-finite native loss")
+            if not torch.isfinite(loss).all():
+                if finite_diagnostics: fail_nonfinite("non_finite_loss", float(loss.detach().float().sum().cpu()))
+                raise FloatingPointError("non-finite native loss")
             total_loss=loss.sum()
             frac=step/max(1,total_steps-1); warm=min(1.0,(step+1)/max(1,int(total_steps*.05)))
             rate=lr*warm*.5*(1+math.cos(math.pi*frac))
             for group in optimizer.param_groups: group["lr"]=rate
-            optimizer.zero_grad(set_to_none=True); total_loss.backward(); optimizer.step()
+            optimizer.zero_grad(set_to_none=True); total_loss.backward()
+            if finite_diagnostics:
+                parameters = [p for group in optimizer.param_groups for p in group["params"] if p.grad is not None]
+                try:
+                    norm = torch.nn.utils.get_total_norm([p.grad for p in parameters])
+                except AttributeError:
+                    norm = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(p.grad.detach().float()) for p in parameters]))
+                if not torch.isfinite(norm): fail_nonfinite("non_finite_gradient_norm", float(total_loss.detach().float().cpu()))
+            optimizer.step()
             epoch_losses.append(float(total_loss.detach().cpu())); step+=1
             if batch_progress: batch_progress({'epoch': epoch+1, 'step': step, 'loss': epoch_losses[-1], 'lr': rate})
         if not epoch_losses: raise ValueError("epoch produced no batches")
@@ -192,7 +216,8 @@ def evaluate_cache(model, reader, annotation, *, device, progress_path=None):
 
 def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, manifest_path,
                annotations_path, trunk_artifact, receipt, output, device, synthetic=False,
-               resume=False, resume_from=None, progress_path=None, stop_epoch=None, head_spec=None):
+               resume=False, resume_from=None, progress_path=None, stop_epoch=None, head_spec=None,
+               finite_diagnostics=False):
     """One fixed-target lifecycle; also the persisted-fixture CPU acceptance path.
 
     cache_evidence maps cohort to an object containing metadata_file_sha256.
@@ -212,8 +237,11 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
         raise ValueError('run is outside frozen matrix')
     if bool(recipe['synthetic']) != synthetic: raise ValueError('synthetic recipe mismatch')
     refinement = purpose == 'main' and recipe.get('environment', {}).get('study_id') == 'ab2_refinement_v1'
+    shared_spatial = purpose == 'main' and recipe.get('environment', {}).get('study_id') == 'shared_spatial_v1'
+    if finite_diagnostics and not (purpose == 'pilot' and seed == 997):
+        raise ValueError('finite diagnostics pilot opt-in is seed 997 only')
     if purpose == 'main':
-        declared_spec = recipe.get('environment', {}).get('head_spec') if refinement else None
+        declared_spec = recipe.get('environment', {}).get('head_spec') if (refinement or shared_spatial) else None
         if head_spec is not None:
             raise ValueError('main head_spec is frozen by the recipe')
         resolved_spec = canonicalize_head_spec(declared_spec)
@@ -271,7 +299,8 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
         initial_head_digest = _head_parameter_digest(model)
         timings['model_and_trunk_seconds'] = time.monotonic()-stage_started
         _progress(progress_path, 'trunk_verified', 1, 1)
-        extended_identity = refinement or resolved_spec is not None
+        extended_identity = refinement or shared_spatial or resolved_spec is not None
+        observe_finite = shared_spatial or (purpose == 'pilot' and finite_diagnostics)
         bindings = {'protocol_sha256': protocol_sha256, 'purpose': purpose, 'arm': arm, 'seed': seed,
                     'trunk_sha256': recipe['trunk_sha256'], 'trunk_digest': frozen_digest,
                     'manifest_file_sha256': manifest_file_sha, 'cache_hashes': {n: readers[n].metadata['metadata_sha256'] for n in names},
@@ -388,7 +417,11 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
             started = time.monotonic()
             result = train(model, batches, epochs=target, seed=seed, start_epoch=epoch, stop_epoch=epoch+1,
                            optimizer=optimizer, criterion=criterion, device=device, restored_rng=continuing,
-                           batch_progress=lambda row: _progress(progress_path, 'train_batch', row['step'], target*batches.steps))
+                           batch_progress=lambda row: _progress(progress_path, 'train_batch', row['step'], target*batches.steps),
+                           finite_diagnostics=observe_finite,
+                           diagnostic_context={'study_id': recipe.get('environment', {}).get('study_id', 'pilot'),
+                                               'variant': 'native' if resolved_spec is None else resolved_spec['variant'],
+                                               'seed': seed, 'failure_path': str(output/'nonfinite.json')})
             criterion = result['criterion']
             row = result['history'][0]; row['train_seconds'] = time.monotonic()-started
             if _trunk_digest(model) != frozen_digest: raise RuntimeError('frozen trunk weights/BN changed')
@@ -447,6 +480,7 @@ def main(argv=None):
             s.add_argument('--imgsz', type=int, required=True); s.add_argument('--epochs', type=int, required=True)
             s.add_argument('--batch-size', type=int, required=True); s.add_argument('--producer', required=True)
             s.add_argument('--head-spec', help='optional canonical spec JSON for the seed-997 technical pilot')
+            s.add_argument('--finite-diagnostics', action='store_true', help='observe finite loss and gradient norm for seed-997 technical pilots')
         else:
             s.add_argument('--protocol', required=True); s.add_argument('--dev-cache', required=True)
             s.add_argument('--probe-cache', required=True); s.add_argument('--annotations', required=True)
@@ -550,7 +584,8 @@ def main(argv=None):
                protocol_sha256=protocol_sha, cache_paths=paths, manifest_path=a.manifest,
                annotations_path=getattr(a, 'annotations', None), trunk_artifact=artifact,
                receipt=_read_json(Path(a.receipt)), output=a.output, device=device, synthetic=a.synthetic,
-               resume_from=a.resume_from, progress_path=progress_path, head_spec=pilot_spec)
+               resume_from=a.resume_from, progress_path=progress_path, head_spec=pilot_spec,
+               finite_diagnostics=getattr(a, 'finite_diagnostics', False))
     return 0
 
 if __name__=="__main__": raise SystemExit(main())

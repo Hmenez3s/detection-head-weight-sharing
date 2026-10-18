@@ -28,9 +28,19 @@ def validate_recipe(recipe, *, synthetic=False):
     if recipe["status"]!="FROZEN": raise ValueError("protocol is not frozen")
     env = recipe["environment"]
     refinement = isinstance(env, dict) and env.get("study_id") == "ab2_refinement_v1"
+    shared_spatial = isinstance(env, dict) and env.get("study_id") == "shared_spatial_v1"
     if refinement:
         if recipe["seed_list"] != [11, 33, 55] or recipe["arms"] != ["loop_ab2"]:
             raise ValueError("refinement matrix must be exactly loop_ab2 and seeds 11,33,55")
+    elif shared_spatial:
+        if recipe["seed_list"] != SEEDS or recipe["arms"] != ["native"]:
+            raise ValueError("shared spatial matrix must be exactly native and five paired seeds")
+        from .head_spec import canonicalize_head_spec
+        if "head_spec" not in env or canonicalize_head_spec(env["head_spec"]) != env["head_spec"]:
+            raise ValueError("shared spatial recipe requires an explicit canonical v2 spec or None")
+        spec = env["head_spec"]
+        if spec is not None and spec.get("version") != 2:
+            raise ValueError("shared spatial recipe requires a native v2 spec")
     elif recipe["seed_list"]!=SEEDS or recipe["arms"] not in (ARMS,LOOPED_MATRIX):
         raise ValueError("main matrix must be exactly five paired seeds and three arms")
     looped = recipe["arms"] == LOOPED_MATRIX
@@ -38,6 +48,13 @@ def validate_recipe(recipe, *, synthetic=False):
         if type(recipe[key]) is not int or recipe[key] < 1: raise ValueError(f"invalid fixed {key}")
     geometry_ok = recipe["imgsz"] >= 64 and recipe["imgsz"] % 32 == 0 if synthetic else recipe["imgsz"] in (512,640)
     if not geometry_ok or recipe["batch_size"]<2: raise ValueError("invalid production geometry/batch")
+    if shared_spatial:
+        dose = (recipe["imgsz"], recipe["batch_size"], recipe["block_size"], recipe["epochs"], recipe["cadence"], recipe["probe_size"])
+        if synthetic:
+            if recipe["epochs"] > 40 or recipe["cadence"] > recipe["epochs"]:
+                raise ValueError("synthetic shared spatial dose exceeds the fixed production target")
+        elif dose != (512,32,32,40,5,1000):
+            raise ValueError("shared spatial production dose must be exactly 512/B32/block32/40/cadence5/probe1000")
     if recipe["block_size"] != recipe["batch_size"]: raise ValueError("physical block size must match extraction/training batch")
     if not synthetic and recipe["probe_size"] != 1000: raise ValueError("main clean probe must contain exactly 1000 images")
     if recipe["epochs"]<1 or recipe["cadence"]>recipe["epochs"]: raise ValueError("invalid fixed evaluation schedule")
@@ -46,6 +63,10 @@ def validate_recipe(recipe, *, synthetic=False):
     expected_seeds = [11, 33, 55] if refinement else SEEDS
     if not isinstance(assignment,dict) or set(assignment)!={str(seed) for seed in expected_seeds} or any(value not in GPU_UUIDS for value in assignment.values()):
         raise ValueError("each complete seed triplet requires one permitted physical GPU")
+    if shared_spatial and assignment != {str(seed): GPU_UUIDS[1] for seed in SEEDS}:
+        raise ValueError("shared spatial seeds must all use the assigned G1 GPU")
+    if shared_spatial and not synthetic and recipe["producer"] != GPU_UUIDS[1]:
+        raise ValueError("shared spatial production cache producer must be the assigned G1 GPU")
     if recipe["selection"] != SELECTION or recipe["numeric_policy"] != NUMERIC_POLICY:
         raise ValueError("selection or numerical policy differs from fixed study contract")
     if recipe["optimizer"]!={"name":"SGD","lr":.01,"momentum":.9,"weight_decay":.0005}: raise ValueError("optimizer proposal differs")
