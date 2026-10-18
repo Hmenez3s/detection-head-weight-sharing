@@ -79,6 +79,69 @@ def test_production_looped_recipe_pins_hashes_not_basenames_and_exact_dose():
         validate_recipe(value,synthetic=False)
 
 
+def refinement_recipe(*, synthetic=True, epochs=2):
+    value = recipe()
+    value.update(seed_list=[11,33,55], arms=["loop_ab2"], imgsz=64 if synthetic else 512,
+                 batch_size=2 if synthetic else 32, block_size=2 if synthetic else 32,
+                 epochs=epochs, cadence=1 if synthetic else 5, probe_size=2 if synthetic else 1000,
+                 synthetic=synthetic, producer="cpu" if synthetic else GPU_UUIDS[1])
+    value["gpu_for_seed"] = {str(seed): GPU_UUIDS[1] for seed in (11,33,55)}
+    value["cache_evidence"] = ({name: {"metadata_file_sha256": "a"*64} for name in ("few","dev","probe")}
+                               if not synthetic else {"few":"x", "dev":"y", "probe":"z"})
+    value["environment"] = {"study_id":"ab2_refinement_v1",
+        "head_spec":{"version":1,"variant":"learned_alpha","class_inner":96},
+        "reference_baseline":{"protocol":{"path":"baseline/source-protocol.json","sha256":"c"*64,
+            "recipe_sha256":"11ad424d07404fd1687c897fb1db51ffc1287a331b2022b73854f14be752e3a2" if not synthetic else "d"*64},
+            "freeze":{"path":"looped-20261017T181804Z/selection/selected.json" if not synthetic else "baseline/selected.json",
+                "sha256":"df3d874822a1c8015c312ac6f0ce8c59b4d64c1494c6ca55f5ddd70c5d7c2a47" if not synthetic else "e"*64}}}
+    return value
+
+
+def test_refinement_recipe_accepts_canonical_specs_without_narrowing_model_schema():
+    value = refinement_recipe()
+    assert validate_recipe(value, synthetic=True)["arms"] == ["loop_ab2"]
+    from head_sharing.head_spec import canonicalize_head_spec
+    specs = [None] + [canonicalize_head_spec({"version":1,"variant":variant,"class_inner":width})
+                      for variant in ("learned_alpha", "step_norm", "scale_gain", "dw5")
+                      for width in (96, 48)]
+    for spec in specs:
+        candidate = refinement_recipe()
+        candidate["environment"]["head_spec"] = spec
+        assert validate_recipe(candidate, synthetic=True)["environment"]["head_spec"] == spec
+    for mutate in (
+        lambda x: x.update(seed_list=[11,33,55,77]),
+        lambda x: x.update(arms=["native"]),
+        lambda x: x["environment"].update(head_spec={"version":1,"variant":"baseline","class_inner":96}),
+        lambda x: x["environment"].update(head_spec={"version":1,"variant":"unknown","class_inner":96}),
+        lambda x: x["environment"].pop("head_spec"),
+        lambda x: x["environment"]["reference_baseline"]["freeze"].update(path="../selected.json"),
+        lambda x: x["environment"]["reference_baseline"]["protocol"].update(sha256="not-a-digest"),
+    ):
+        invalid = refinement_recipe(); mutate(invalid)
+        with pytest.raises(ValueError): validate_recipe(invalid, synthetic=True)
+    production = refinement_recipe(synthetic=False, epochs=80)
+    assert validate_recipe(production, synthetic=False)["epochs"] == 80
+    for dose in (40,80):
+        production = refinement_recipe(synthetic=False, epochs=dose)
+        production["environment"]["reference_baseline"]["protocol"]["recipe_sha256"] = "0"*64
+        with pytest.raises(ValueError, match="pinned"):
+            validate_recipe(production, synthetic=False)
+    production = refinement_recipe(synthetic=False, epochs=40)
+    production["environment"]["reference_baseline"]["protocol"]["recipe_sha256"] = "11ad424d07404fd1687c897fb1db51ffc1287a331b2022b73854f14be752e3a2"
+    assert validate_recipe(production, synthetic=False)["epochs"] == 40
+    for dose in (40,80):
+        production = refinement_recipe(synthetic=False, epochs=dose)
+        production["environment"]["reference_baseline"]["protocol"]["recipe_sha256"] = "11ad424d07404fd1687c897fb1db51ffc1287a331b2022b73854f14be752e3a2"
+        for spec in ([None] + [{"version":1,"variant":variant,"class_inner":width}
+                               for variant in ("learned_alpha", "step_norm", "scale_gain", "dw5")
+                               for width in (96,48)]):
+            production["environment"]["head_spec"] = spec
+            assert validate_recipe(production, synthetic=False)["environment"]["head_spec"] == spec
+    production["epochs"] = 81
+    with pytest.raises(ValueError, match="dose"):
+        validate_recipe(production, synthetic=False)
+
+
 def test_tiny_geometry_is_synthetic_only_and_real_evidence_is_typed():
     value=recipe();value['imgsz']=64;value['probe_size']=2
     assert validate_recipe(value,synthetic=True)['imgsz']==64

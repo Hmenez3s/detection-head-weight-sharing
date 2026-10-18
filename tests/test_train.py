@@ -70,12 +70,35 @@ def test_synthetic_journey_runs_under_isolated_cpu_wrapper():
     for arm in ('native', 'independent_k2', 'shared_k2'):
         record=json.load(open(os.path.join(os.environ['HEAD_SHARING_TEST_ROOT'], 'journey', arm+'-continued', 'training.json')))
         assert record['schema_version']==1 and record['purpose']=='main'
+        assert not {'recipe', 'head_spec', 'head_spec_sha256'} & record.keys()
+        resume = __import__('torch').load(os.path.join(os.environ['HEAD_SHARING_TEST_ROOT'], 'journey', arm+'-continued', 'resume.pt'),
+                                          map_location='cpu', weights_only=True)
+        assert not {'head_spec', 'head_spec_sha256'} & resume.keys()
+        assert 'recipe' in resume['training_state']
         assert record['epochs_completed']==record['target_epochs']==2
         assert record['selected_config'] and record['last_config'] == 'last.json'
         assert record['numeric_policy']['deterministic_algorithms'] is False
         assert record['numeric_policy']['cudnn_deterministic'] is False
         assert all('dev' in row and 'probe' in row and 'gap' in row for row in record['history'])
         assert not any(os.environ['HEAD_SHARING_TEST_ROOT'] in str(value) for value in record.values())
+
+
+def test_cli_head_spec_is_pilot_only_and_preimport_guarded():
+    code = """
+import sys
+from head_sharing.train import main
+try:
+    main(['run','--arm','loop_ab2','--seed','11','--device','cpu','--cache','x','--dev-cache','x',
+          '--probe-cache','x','--output','x','--manifest','x','--receipt','x','--trunk-artifact','x',
+          '--protocol','x','--annotations','x','--head-spec','x'])
+except SystemExit:
+    pass
+else:
+    raise AssertionError('main frozen recipe exposed a head_spec override')
+assert 'torch' not in sys.modules and 'ultralytics' not in sys.modules
+"""
+    proc = subprocess.run([sys.executable,"-c",code],stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=20)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_cli_rejects_unsupervised_gpu_and_non_synthetic_cpu_before_native_imports():
@@ -238,3 +261,118 @@ def test_metric_gt_preserves_original_values_without_borrowing_source_heap(tmp_p
     assert result['annotations'][0]['bbox'][0] is not source['annotations'][0]['bbox'][0]
     assert result['annotations'][0]['iscrowd'] == 1
     assert result['annotations'][0]['area'] == source['annotations'][0]['area']
+
+
+def test_native_refinement_schedule_uses_fresh_40_and_80_targets():
+    import torch
+    from head_sharing.model import HeadStudyModel
+    from head_sharing.train import train
+
+    torch.set_num_threads(1)
+    class EmptyBatches:
+        steps = 3
+    schedule = []
+    for target in (40, 80):
+        model = HeadStudyModel("loop_ab2", seed=11, imgsz=64,
+                               head_spec={"version":1,"variant":"learned_alpha","class_inner":96})
+        result = train(model, EmptyBatches(), epochs=target, seed=11, stop_epoch=0)
+        schedule.append((result["criterion"].one2one.hyp.epochs, result["total_steps"], result["step"]))
+    assert schedule == [(40,120,0),(80,240,0)]
+
+
+def test_frozen_refinement_main_cli_learned_alpha_and_resume_identity(tmp_path):
+    import hashlib
+    import pytest
+    import torch
+    from head_sharing import cache
+    from head_sharing.model import HeadStudyModel
+    from head_sharing.protocol import NUMERIC_POLICY, SELECTION, freeze
+    from head_sharing.runtime import GPU_UUIDS
+    from test_cache import RECEIPT, fixture
+
+    torch.set_num_threads(1)
+    root = tmp_path / "refinement"
+    images, annotations, manifest_path, receipt_path, _, _ = fixture(root / "inputs")
+    source_annotations = json.loads(annotations.read_text())
+    for row in source_annotations["annotations"]:
+        row["area"] = row["bbox"][2] * row["bbox"][3]
+    annotations.write_text(json.dumps(source_annotations))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["source_annotation_sha256"] = hashlib.sha256(annotations.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest))
+    trunk_model = HeadStudyModel("loop_ab2", seed=123, imgsz=64).eval()
+    artifact = {"state_dict": {k:v.detach().cpu() for k,v in trunk_model.detector.state_dict().items()
+                               if k.startswith("model.") and int(k.split(".")[1]) < 23},
+               "schema_version":1,"architecture":"yolo26n","upstream":"8.4.177","excluded_head_index":23}
+    artifact_path = root / "trunk.pt"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(artifact, artifact_path)
+    cache_paths, evidence = {}, {}
+    for cohort in ("few", "dev", "probe"):
+        path = root / ("cache-" + cohort)
+        cache.build_cache(image_root=images, annotations_path=annotations, manifest_path=manifest_path,
+                          receipt_path=receipt_path, trunk_artifact=artifact, output=path,
+                          model=trunk_model, producer="cpu", cohort=cohort, batch_size=2, synthetic=True)
+        cache_paths[cohort] = path
+        evidence[cohort] = {"metadata_file_sha256": cache._sha(path / "metadata.json")}
+    spec = {"version":1,"variant":"learned_alpha","class_inner":96}
+    recipe = {"status":"FROZEN","seed_list":[11,33,55],"arms":["loop_ab2"],"imgsz":64,
+        "batch_size":2,"epochs":2,"cadence":1,"block_size":2,"probe_size":2,
+        "optimizer":{"name":"SGD","lr":.01,"momentum":.9,"weight_decay":.0005},
+        "gains":{"box":7.5,"cls":.5,"dfl":1.5},"quantization":"fp32_fp16_fp32_v1",
+        "producer":"cpu","environment":{"study_id":"ab2_refinement_v1","torch":"synthetic",
+            "head_spec":spec,"reference_baseline":{"protocol":{"path":"baseline/source.json","sha256":"c"*64,"recipe_sha256":"d"*64},
+            "freeze":{"path":"baseline/selected.json","sha256":"e"*64}}},
+        "trunk_sha256":RECEIPT["trunk_artifact_sha256"],"split_sha256":cache._sha(manifest_path),
+        "cache_evidence":evidence,"pilot_evidence":{"ids":[997]},"synthetic":True,
+        "gpu_for_seed":{str(seed):GPU_UUIDS[1] for seed in (11,33,55)},
+        "selection":dict(SELECTION),"numeric_policy":dict(NUMERIC_POLICY)}
+    recipe_path, protocol_path = root/"recipe.json", root/"protocol.json"
+    recipe_path.write_text(json.dumps(recipe))
+    frozen = freeze(recipe_path, protocol_path, synthetic=True)
+    cli_output = root / "cli-output"
+    command = [sys.executable,"-m","head_sharing.train","run","--device","cpu","--arm","loop_ab2",
+        "--seed","11","--cache",str(cache_paths["few"]),"--dev-cache",str(cache_paths["dev"]),
+        "--probe-cache",str(cache_paths["probe"]),"--output",str(cli_output),"--manifest",str(manifest_path),
+        "--receipt",str(receipt_path),"--trunk-artifact",str(artifact_path),"--protocol",str(protocol_path),
+        "--annotations",str(annotations),"--synthetic"]
+    proc = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180,
+                          env={**os.environ,"CUDA_VISIBLE_DEVICES":"-1","HEAD_SHARING_TEST_ROOT":str(tmp_path.resolve())})
+    assert proc.returncode == 0, proc.stderr
+    record = json.loads((cli_output/"training.json").read_text())
+    assert record["head_spec"] == spec and record["head_spec_sha256"]
+    assert record["recipe"] == recipe and record["target_epochs"] == record["epochs_completed"] == 2
+    assert record["selected_epoch"] in (1,2) and all("dev" in row and "probe" in row for row in record["history"])
+    assert record["head_updated"] is True
+    checkpoint = torch.load(cli_output/"resume.pt", map_location="cpu", weights_only=True)
+    assert checkpoint["head_spec"] == spec and checkpoint["head_spec_sha256"] == record["head_spec_sha256"]
+    assert checkpoint["training_state"]["recipe"] == recipe
+
+    from head_sharing.train import experiment
+    common = dict(purpose="main",arm="loop_ab2",seed=11,recipe=recipe,protocol_sha256=frozen["recipe_sha256"],
+        cache_paths=cache_paths,manifest_path=manifest_path,annotations_path=annotations,trunk_artifact=artifact,
+        receipt=RECEIPT,device="cpu",synthetic=True)
+    interrupted = root/"interrupted"
+    experiment(**common,output=interrupted,stop_epoch=1)
+    with pytest.raises(ValueError,match="head_spec"):
+        experiment(**{**common,"recipe":{**recipe,"environment":{**recipe["environment"],
+            "head_spec":{"version":1,"variant":"scale_gain","class_inner":96}}}},output=interrupted,resume=True)
+    checkpoint_sha = cache._sha(interrupted/"resume.pt")
+    with pytest.raises(ValueError,match="fixed target"):
+        experiment(**{**common,"recipe":{**recipe,"epochs":3}},output=interrupted,resume=True)
+    assert cache._sha(interrupted/"resume.pt") == checkpoint_sha
+    recovered = experiment(**common,output=interrupted,resume=True)
+    baseline_history = json.loads((cli_output/"training.json").read_text())["history"]
+    fields = ("epoch", "loss", "o2m", "lr", "dev", "probe", "gap")
+    assert [{k:row[k] for k in fields if k in row} for row in recovered["history"]] == [
+        {k:row[k] for k in fields if k in row} for row in baseline_history]
+    cli_resume = torch.load(cli_output/"resume.pt", map_location="cpu", weights_only=True)
+    resumed = torch.load(interrupted/"resume.pt", map_location="cpu", weights_only=True)
+    def equal_state(left, right):
+        if isinstance(left, torch.Tensor): return isinstance(right, torch.Tensor) and torch.equal(left, right)
+        if isinstance(left, dict): return isinstance(right, dict) and left.keys() == right.keys() and all(equal_state(left[k], right[k]) for k in left)
+        if isinstance(left, (list, tuple)): return type(left) is type(right) and len(left) == len(right) and all(equal_state(a,b) for a,b in zip(left,right))
+        return left == right
+    assert equal_state(cli_resume["model"], resumed["model"])
+    assert equal_state(cli_resume["optimizer"], resumed["optimizer"])
+    assert torch.equal(cli_resume["rng"]["torch_cpu"], resumed["rng"]["torch_cpu"])

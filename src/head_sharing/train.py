@@ -192,7 +192,7 @@ def evaluate_cache(model, reader, annotation, *, device, progress_path=None):
 
 def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, manifest_path,
                annotations_path, trunk_artifact, receipt, output, device, synthetic=False,
-               resume=False, resume_from=None, progress_path=None, stop_epoch=None):
+               resume=False, resume_from=None, progress_path=None, stop_epoch=None, head_spec=None):
     """One fixed-target lifecycle; also the persisted-fixture CPU acceptance path.
 
     cache_evidence maps cohort to an object containing metadata_file_sha256.
@@ -204,12 +204,21 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
     from .cache import load_cache, _read_json, _sha, _atomic_json, _progress
     from .data import fixed_blocks
     from .model import HeadStudyModel
+    from .head_spec import canonicalize_head_spec, head_spec_digest
     from .checkpoint import load_trunk_artifact, save_checkpoint, load_checkpoint, load_resume, resume_training_state, _rng_state, _restore_rng
     if purpose not in ('pilot', 'main'): raise ValueError('unknown experiment purpose')
     if purpose == 'pilot' and seed != 997: raise ValueError('technical pilot requires seed 997')
     if purpose == 'main' and (seed not in recipe['seed_list'] or arm not in recipe['arms']):
         raise ValueError('run is outside frozen matrix')
     if bool(recipe['synthetic']) != synthetic: raise ValueError('synthetic recipe mismatch')
+    refinement = purpose == 'main' and recipe.get('environment', {}).get('study_id') == 'ab2_refinement_v1'
+    if purpose == 'main':
+        declared_spec = recipe.get('environment', {}).get('head_spec') if refinement else None
+        if head_spec is not None:
+            raise ValueError('main head_spec is frozen by the recipe')
+        resolved_spec = canonicalize_head_spec(declared_spec)
+    else:
+        resolved_spec = canonicalize_head_spec(head_spec)
     target = recipe['epochs']; cadence = recipe['cadence']; size = recipe['imgsz']; batch = recipe['batch_size']
     if type(target) is not int or target < 1 or not 1 <= cadence <= target: raise ValueError('invalid target/cadence')
     manifest = _read_json(Path(manifest_path))
@@ -256,16 +265,19 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
         timings['metric_gt_seconds'] = time.monotonic()-stage_started
         stage_started = time.monotonic()
         _progress(progress_path, 'trunk_loading', 0, 1)
-        model = HeadStudyModel(arm, seed, size).to(device)
+        model = HeadStudyModel(arm, seed, size, head_spec=resolved_spec).to(device)
         load_trunk_artifact(model, trunk_artifact, receipt=receipt, synthetic=synthetic)
         frozen_digest = _trunk_digest(model)
         initial_head_digest = _head_parameter_digest(model)
         timings['model_and_trunk_seconds'] = time.monotonic()-stage_started
         _progress(progress_path, 'trunk_verified', 1, 1)
+        extended_identity = refinement or resolved_spec is not None
         bindings = {'protocol_sha256': protocol_sha256, 'purpose': purpose, 'arm': arm, 'seed': seed,
                     'trunk_sha256': recipe['trunk_sha256'], 'trunk_digest': frozen_digest,
                     'manifest_file_sha256': manifest_file_sha, 'cache_hashes': {n: readers[n].metadata['metadata_sha256'] for n in names},
                     'target_epochs': target, 'synthetic': synthetic, 'recipe': recipe}
+        if extended_identity:
+            bindings.update(head_spec=resolved_spec, head_spec_sha256=head_spec_digest(resolved_spec))
         numeric = {'trunk': 'FP32', 'Q': HeadStudyModel.quantization, 'training_head': 'BF16' if device != 'cpu' else 'FP32',
                    'metric_head': 'FP32', 'effective_tf32': False, 'CUBLAS_WORKSPACE_CONFIG': ':4096:8', 'ema': False,
                    'cuda_matmul_allow_tf32': torch.backends.cuda.matmul.allow_tf32,
@@ -308,9 +320,12 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
                 if not previous_record.is_file():
                     raise ValueError('completed checkpoint lacks presentation baseline')
                 record = _read_json(previous_record)
-                if not isinstance(record, dict) or any(record.get(key) != value for key, value in {
-                        'schema_version': 1, 'purpose': purpose, 'arm': arm, 'seed': seed,
-                        'protocol_sha256': protocol_sha256, 'target_epochs': target}.items()):
+                expected_record = {'schema_version': 1, 'purpose': purpose, 'arm': arm, 'seed': seed,
+                                   'protocol_sha256': protocol_sha256, 'target_epochs': target}
+                if extended_identity:
+                    expected_record.update(recipe=recipe, head_spec=resolved_spec,
+                                           head_spec_sha256=head_spec_digest(resolved_spec))
+                if not isinstance(record, dict) or any(record.get(key) != value for key, value in expected_record.items()):
                     raise ValueError('completed checkpoint presentation baseline binding mismatch')
                 initial_digest = record.get('initial_head_parameter_sha256')
                 if not isinstance(initial_digest, str) or len(initial_digest) != 64 or any(c not in '0123456789abcdef' for c in initial_digest):
@@ -348,6 +363,9 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
                                'last_config': 'last.json', 'history': history, 'hardware': hardware,
                                'numeric_policy': numeric, 'frozen_trunk_digest': frozen_digest,
                                'stage_timings': timings, 'last_head_parameter_sha256': last_digest})
+                if extended_identity:
+                    record.update(recipe=recipe, head_spec=resolved_spec,
+                                  head_spec_sha256=head_spec_digest(resolved_spec))
                 record['head_updated'] = record.get('last_head_parameter_sha256') != record.get('initial_head_parameter_sha256')
                 _atomic_json(output/'training.json', record)
                 return record
@@ -404,6 +422,9 @@ def experiment(*, purpose, arm, seed, recipe, protocol_sha256, cache_paths, mani
                       'history': history, 'hardware': hardware, 'numeric_policy': numeric, 'frozen_trunk_digest': frozen_digest,
                       'stage_timings': timings, 'initial_head_parameter_sha256': initial_head_digest,
                       'last_head_parameter_sha256': _head_parameter_digest(model)}
+            if extended_identity:
+                record.update(recipe=recipe, head_spec=resolved_spec,
+                              head_spec_sha256=head_spec_digest(resolved_spec))
             record['head_updated'] = record['last_head_parameter_sha256'] != initial_head_digest
             _atomic_json(output/'training.json', record)
             _progress(progress_path, 'epoch_committed', epoch+1, target)
@@ -425,6 +446,7 @@ def main(argv=None):
         if name == 'pilot':
             s.add_argument('--imgsz', type=int, required=True); s.add_argument('--epochs', type=int, required=True)
             s.add_argument('--batch-size', type=int, required=True); s.add_argument('--producer', required=True)
+            s.add_argument('--head-spec', help='optional canonical spec JSON for the seed-997 technical pilot')
         else:
             s.add_argument('--protocol', required=True); s.add_argument('--dev-cache', required=True)
             s.add_argument('--probe-cache', required=True); s.add_argument('--annotations', required=True)
@@ -473,7 +495,7 @@ def main(argv=None):
         if os.environ.get('CUDA_VISIBLE_DEVICES') != a.device: raise RuntimeError('assigned UUID mismatch')
         device = 'cuda'
     # Validate every declared path before importing the native runtime.
-    for key in ('cache', 'dev_cache', 'probe_cache', 'manifest', 'receipt', 'trunk_artifact', 'annotations', 'protocol', 'resume_from', 'output'):
+    for key in ('cache', 'dev_cache', 'probe_cache', 'manifest', 'receipt', 'trunk_artifact', 'annotations', 'protocol', 'resume_from', 'output', 'head_spec'):
         value = getattr(a, key, None)
         if value is None: continue
         path = Path(value).absolute()
@@ -488,6 +510,10 @@ def main(argv=None):
         if not a.synthetic and recipe['gpu_for_seed'].get(str(a.seed)) != a.device: raise ValueError('seed assigned to another physical GPU')
     else:
         if a.seed != 997: raise ValueError('technical pilot seed is 997 only')
+        pilot_spec = None
+        if a.head_spec:
+            from .head_spec import canonicalize_head_spec
+            pilot_spec = canonicalize_head_spec(_read_json(Path(a.head_spec)))
         metadata = _read_json(Path(a.cache)/'metadata.json')
         if not a.synthetic and (metadata['count'] != 512 or len(metadata['cohort_ids']['few']) != 512):
             raise ValueError('pilot requires its separate technical 512-image cache')
@@ -496,6 +522,7 @@ def main(argv=None):
                   'quantization': metadata['quantization'], 'cache_evidence': {'few': {'metadata_file_sha256': _sha(Path(a.cache)/'metadata.json')}},
                   'synthetic': a.synthetic, 'gpu_for_seed': {str(a.seed): a.device}}
         protocol_sha = None
+    if a.command == 'run': pilot_spec = None
     _progress(progress_path, 'ownership_verified', 1, 1)
     import torch
     import cv2
@@ -523,7 +550,7 @@ def main(argv=None):
                protocol_sha256=protocol_sha, cache_paths=paths, manifest_path=a.manifest,
                annotations_path=getattr(a, 'annotations', None), trunk_artifact=artifact,
                receipt=_read_json(Path(a.receipt)), output=a.output, device=device, synthetic=a.synthetic,
-               resume_from=a.resume_from, progress_path=progress_path)
+               resume_from=a.resume_from, progress_path=progress_path, head_spec=pilot_spec)
     return 0
 
 if __name__=="__main__": raise SystemExit(main())
