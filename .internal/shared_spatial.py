@@ -378,7 +378,7 @@ def render_dev_report(study, decision):
             else:
                 raise ValueError("report cannot treat an unstarted condition as closed")
     winner = decision.get("winner")
-    if winner is not None:
+    if winner is not None and followups:
         lines.extend(["", "## Fresh native and winner follow-ups"])
         for seed in (22, 44, 55):
             for variant in ("native", winner):

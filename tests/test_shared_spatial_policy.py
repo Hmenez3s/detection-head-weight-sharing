@@ -125,6 +125,10 @@ def test_screen_requires_all_twelve_and_selects_only_positive_paired_candidates(
     assert decision["winner"] == "spatial_sepbn"  # fixed tie order; untied is descriptive only
     assert len(decision["screen"]) == 12 and len(decision["followup_cells"]) == 6
     assert decision["final_inference_authorized"] is False
+    pending_report = policy.render_dev_report({"screens": decision["screen"]}, decision)
+    assert "Selected at most one candidate: spatial_sepbn" in pending_report
+    assert "five-pair group is incomplete" in pending_report
+    assert "Mean paired DEV delta" not in pending_report
     no_gain = policy.decide_stages(_screen())
     assert no_gain["winner"] is None and no_gain["followup_cells"] == []
     with pytest.raises(ValueError, match="unstarted"):
