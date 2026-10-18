@@ -202,7 +202,8 @@ def project_training_record(path, expected_sha256, *, recipe, seed, selected_con
             "selected_config": dict(selected_config), "selected_weights": dict(selected_weights),
             "recipe_sha256": recipe_sha, "head_spec_sha256": head_spec_digest(spec),
             "trunk_sha256": recipe["trunk_sha256"], "frozen_trunk_digest": trunk,
-            "source": copy.deepcopy(env.get("source_protocol")), "closed": True}
+            "source": copy.deepcopy(env.get("source_protocol")), "closed": True,
+            "status": "completed"}
 
 
 def _row_key(row):

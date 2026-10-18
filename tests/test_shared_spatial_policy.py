@@ -205,6 +205,10 @@ def test_sealed_training_projection_binds_full_recipe_history_and_selected_files
         selected_config={"path": str(config_path), "sha256": hashlib.sha256(config_bytes).hexdigest()},
         selected_weights={"path": str(weights_path), "sha256": hashlib.sha256(weights_path.read_bytes()).hexdigest()})
     assert projected["closed"] and projected["selected_epoch"] == 35 and projected["dev_ap"] == .3
+    assert projected["status"] == "completed"
+    screen = [projected if (row["variant"], row["seed"]) == ("native", 11) else row
+              for row in _screen()]
+    assert policy.decide_stages(screen)["screen_closed"] is True
     wrong = dict(record, selected_epoch=40)
     wrong_path = tmp_path / "wrong.json"
     wrong_bytes = json.dumps(wrong, sort_keys=True).encode()
