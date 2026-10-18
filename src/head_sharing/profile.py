@@ -274,6 +274,14 @@ def main(argv=None):
     artifact=torch.load(args.trunk_artifact,map_location="cpu",weights_only=True) if args.synthetic else args.trunk_artifact
     model=load_checkpoint(args.weights,args.config,trunk_artifact=artifact,synthetic_trunk=args.synthetic,map_location="cpu")
     if model.imgsz!=args.imgsz: raise ValueError("checkpoint resolution differs from profile")
+    environment = recipe.get("environment", {})
+    refinement = isinstance(environment, dict) and environment.get("study_id") == "ab2_refinement_v1"
+    if refinement:
+        from .head_spec import canonicalize_head_spec
+        if (model.arm not in recipe["arms"] or model.seed not in recipe["seed_list"] or
+                environment.get("head_spec") != model.head_spec or
+                canonicalize_head_spec(environment.get("head_spec")) != model.head_spec):
+            raise ValueError("loaded checkpoint arm, seed, or head_spec differs from frozen refinement recipe")
     if args.measurement == "inference" and args.inference_policy == "fused_one2one":
         model = _fused_inference_copy(model, torch)
     model = model.to(device)
@@ -297,6 +305,11 @@ def main(argv=None):
             "execution_uuid":args.uuid if device.type=="cuda" else None,
             "measurement_inputs":{"batch_size":args.batch_size,"images":"zero-valued FP32 NCHW synthetic/inference tensor",
                                   "shape":[args.batch_size,3,args.imgsz,args.imgsz]}}
+    if refinement or model.head_spec is not None:
+        from .head_spec import head_spec_digest
+        result["model_identity"].update({"head_spec":model.head_spec,
+                                         "head_spec_sha256":head_spec_digest(model.head_spec),
+                                         "variant":"baseline" if model.head_spec is None else model.head_spec["variant"]})
     if args.measurement=="inference":
         images=torch.zeros(args.batch_size,3,args.imgsz,args.imgsz,device=device,dtype=torch.float32)
         model.eval()

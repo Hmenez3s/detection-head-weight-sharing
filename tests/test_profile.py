@@ -232,6 +232,83 @@ def test_persisted_synthetic_cpu_profile_cli_binds_loaded_checkpoint(tmp_path):
     assert {p:hashlib.sha256(p.read_bytes()).hexdigest() for p in hashes} == hashes
 
 
+def test_persisted_refinement_profile_binds_format2_spec_and_rejects_mismatch(tmp_path):
+    import hashlib, json
+    from head_sharing.checkpoint import save_checkpoint
+    from head_sharing.head_spec import head_spec_digest
+    from head_sharing.protocol import NUMERIC_POLICY, SELECTION, freeze
+    from head_sharing.runtime import GPU_UUIDS
+
+    spec = {"version": 1, "variant": "learned_alpha", "class_inner": 96}
+    model = HeadStudyModel("loop_ab2", seed=33, imgsz=64, head_spec=spec).eval()
+    features = [torch.randn(1, channels, side, side) for channels, side in ((64,8),(128,4),(256,2))]
+    with torch.inference_mode():
+        retained = model.forward_features(features)
+        fused_model = _fused_inference_copy(model, torch)
+        deployed = fused_model.forward_features(features)
+    assert torch.allclose(retained[0], deployed[0], rtol=1e-6, atol=1e-6)
+    for key in ("boxes", "scores"):
+        assert torch.allclose(retained[1]["one2one"][key], deployed[1]["one2one"][key], rtol=1e-6, atol=1e-6)
+    artifact = {"schema_version": 1, "architecture": "yolo26n", "upstream": "8.4.177", "excluded_head_index": 23,
+                "state_dict": {k: v.detach().cpu().clone() for k, v in model.detector.state_dict().items()
+                               if k.startswith("model.") and int(k.split(".")[1]) < 23}}
+    trunk = tmp_path / "trunk.pt"; torch.save(artifact, trunk)
+    receipt = {"trunk_artifact_sha256": "f01ec41445fac9ef7078b48ef1b73473e6314bcb1a77e77c20666d6ecfcd9016",
+               "trunk_tensors": 468, "trunk_bytes": 9109168, "head_index": 23, "input_channels": [64,128,256],
+               "source_variant": "U", "source_seed": 11, "source_epoch_zero_based": 79,
+               "source_training_epochs": 80, "pre_exposure": "synthetic generated topology fixture"}
+    weights, config = tmp_path / "selected.pt", tmp_path / "selected.json"
+    save_checkpoint(model, weights, config, receipt)
+    reference = {"protocol": {"path": "source/protocol.json", "sha256": "a"*64, "recipe_sha256": "b"*64},
+                 "freeze": {"path": "source/freeze.json", "sha256": "c"*64}}
+    recipe = {"status":"FROZEN", "seed_list":[11,33,55], "arms":["loop_ab2"], "imgsz":64,
+              "batch_size":2,"epochs":2,"cadence":1,"block_size":2,"probe_size":2,
+              "optimizer":{"name":"SGD","lr":.01,"momentum":.9,"weight_decay":.0005},
+              "gains":{"box":7.5,"cls":.5,"dfl":1.5},"quantization":"fp32_fp16_fp32_v1",
+              "producer":GPU_UUIDS[1],"environment":{"device":"CPU synthetic","study_id":"ab2_refinement_v1",
+              "head_spec":spec,"reference_baseline":reference},"trunk_sha256":receipt["trunk_artifact_sha256"],
+              "split_sha256":"d"*64,"cache_evidence":{"synthetic":True},"pilot_evidence":{"synthetic":True},
+              "synthetic":True,"gpu_for_seed":{str(seed):GPU_UUIDS[0] for seed in (11,33,55)},
+              "selection":SELECTION,"numeric_policy":NUMERIC_POLICY}
+    recipe_path=tmp_path/"recipe.json"; protocol=tmp_path/"protocol.json"
+    recipe_path.write_text(json.dumps(recipe)); freeze(recipe_path,protocol,synthetic=True)
+    args = ["--device","cpu","--synthetic","--weights",str(weights),"--config",str(config),
+            "--trunk-artifact",str(trunk),"--protocol",str(protocol),"--imgsz","64","--batch-size","1",
+            "--warmup","0","--repetitions","1"]
+    output=tmp_path/"profile.json"
+    hashes={p:hashlib.sha256(p.read_bytes()).hexdigest() for p in (weights,config,trunk)}
+    assert main([*args,"--output",str(output)]) == 0
+    result=json.loads(output.read_text())
+    assert result["model_identity"]["head_spec"] == spec
+    assert result["model_identity"]["head_spec_sha256"] == head_spec_digest(spec)
+    assert result["model_identity"]["variant"] == "learned_alpha"
+    assert result["model_identity"]["recipe_sha256"]
+    assert result["checkpoint_files_unchanged"] is True
+    fused_output=tmp_path/"fused.json"
+    assert main([*args,"--inference-policy","fused_one2one","--output",str(fused_output)]) == 0
+    fused=json.loads(fused_output.read_text())
+    assert fused["model_identity"] == result["model_identity"]
+    assert fused["branch_policy"] == "fused_one2one"
+    before=hashes.copy()
+    mismatch={"version":1,"variant":"step_norm","class_inner":96}
+    wrong=HeadStudyModel("loop_ab2",seed=33,imgsz=64,head_spec=mismatch)
+    save_checkpoint(wrong,weights,config,receipt)
+    mismatched_hashes={p:hashlib.sha256(p.read_bytes()).hexdigest() for p in (weights,config,trunk)}
+    rejected=tmp_path/"rejected.json"
+    with pytest.raises(ValueError,match="head_spec differs"):
+        main([*args,"--output",str(rejected)])
+    assert not rejected.exists()
+    assert {p:hashlib.sha256(p.read_bytes()).hexdigest() for p in (weights,config,trunk)} == mismatched_hashes
+    assert before[trunk] == mismatched_hashes[trunk]
+    wrong_seed = HeadStudyModel("loop_ab2", seed=22, imgsz=64, head_spec=spec)
+    save_checkpoint(wrong_seed,weights,config,receipt)
+    seed_hashes={p:hashlib.sha256(p.read_bytes()).hexdigest() for p in (weights,config,trunk)}
+    with pytest.raises(ValueError,match="arm, seed, or head_spec"):
+        main([*args,"--output",str(tmp_path/"wrong-seed.json")])
+    assert not (tmp_path/"wrong-seed.json").exists()
+    assert {p:hashlib.sha256(p.read_bytes()).hexdigest() for p in (weights,config,trunk)} == seed_hashes
+
+
 def test_looped_profile_fuse_preserves_selected_outputs_and_counts_real_calls():
     expected_macs = {"native":384606208,"loop_ab2":631357440,"loop_a3":636919808}
     expected_calls = {"native":48,"loop_ab2":44,"loop_a3":40}
