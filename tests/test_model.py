@@ -70,7 +70,7 @@ def test_head_spec_canonicalization_alpha_and_diagnostics():
         with pytest.raises(ValueError): canonicalize_head_spec(invalid)
     with pytest.raises(ValueError, match="only for loop_ab2"):
         HeadStudyModel("native", 11, 32, head_spec=alpha_spec)
-    for unsupported in ("step_norm", "scale_gain", "dw5"):
+    for unsupported in ("dw5",):
         with pytest.raises(ValueError, match="not implemented"):
             HeadStudyModel("loop_ab2", 11, 32, head_spec={"version": 1, "variant": unsupported, "class_inner": 96})
 
@@ -107,6 +107,142 @@ def test_head_spec_canonicalization_alpha_and_diagnostics():
     old_alpha = [tower.alpha.detach().clone() for tower in towers]
     optimizer.step()
     assert all(not torch.equal(old, tower.alpha) for old, tower in zip(old_alpha, towers, strict=True))
+
+
+@pytest.mark.parametrize("variant", ("step_norm", "scale_gain"))
+def test_calibration_variants_expected_update_gradients_and_roundtrip(tmp_path, variant):
+    from head_sharing.train import optimizer_groups
+    spec = {"version": 1, "variant": variant, "class_inner": 96}
+    rng_before = torch.get_rng_state().clone()
+    baseline = HeadStudyModel("loop_ab2", 11, 32).eval()
+    model = HeadStudyModel("loop_ab2", 11, 32, head_spec=spec).eval()
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    features = [torch.randn(2, c, n, n) for c, n in ((64, 4), (128, 2), (256, 1))]
+    expected_initial = baseline.forward_features(features)
+    actual_initial = model.forward_features(features)
+    for branch in ("one2many", "one2one"):
+        for key in ("boxes", "scores"):
+            assert torch.allclose(expected_initial[1][branch][key], actual_initial[1][branch][key], atol=1e-6, rtol=1e-6)
+
+    towers = [model.detect.cv2[0], model.detect.cv3[0], model.detect.one2one_cv2[0], model.detect.one2one_cv3[0]]
+    if variant == "step_norm":
+        for tower in towers:
+            with torch.no_grad():
+                tower.norm_a_steps[0].weight.fill_(1.25)
+                tower.norm_a_steps[1].weight.fill_(0.75)
+                tower.norm_b_steps[0].bias.fill_(0.2)
+                tower.norm_b_steps[1].bias.fill_(-0.15)
+    else:
+        for tower in towers:
+            with torch.no_grad():
+                tower.gain_a[0].fill_(0.4); tower.gain_a[1].fill_(1.7)
+                tower.gain_b[0].fill_(1.3); tower.gain_b[2].fill_(0.6)
+    tower = towers[0]
+    points = [(tower.adapters[i](feature) + tower.scale_id[i][None, :, None, None]).flatten(2).unsqueeze(2)
+              for i, feature in enumerate(model.quantize_features(features))]
+    hidden = torch.cat(points, dim=-1)
+    expected = hidden
+    expected_first_update = None
+
+    def expected_preact(value, norm, gains):
+        normalized = norm(value.permute(0, 3, 2, 1))
+        if gains is not None:
+            offset = 0
+            segments = []
+            for level, point in enumerate(points):
+                count = point.shape[-1]
+                segments.append(normalized[:, offset:offset + count] * gains[level])
+                offset += count
+            normalized = torch.cat(segments, dim=1)
+        return torch.nn.functional.silu(normalized).permute(0, 3, 2, 1)
+
+    for step in range(2):
+        norm_a = tower.norm_a_steps[step] if variant == "step_norm" else tower.norm_a
+        norm_b = tower.norm_b_steps[step] if variant == "step_norm" else tower.norm_b
+        gain_a = tower.gain_a if variant == "scale_gain" else None
+        gain_b = tower.gain_b if variant == "scale_gain" else None
+        update_a = tower.a(expected_preact(expected, norm_a, gain_a))
+        update_b = tower.b(expected_preact(update_a, norm_b, gain_b))
+        if step == 0:
+            expected_first_update = update_b
+        expected = expected + 0.1 * update_b
+    actual = tower._updates(hidden, "loop_ab2", [0, 1, 2], [p.shape[-1] for p in points])
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    joint = tower(features, "loop_ab2")
+    isolated = torch.cat([tower([feature], "loop_ab2", level_indices=[level])
+                          for level, feature in enumerate(features)], dim=-1)
+    assert torch.allclose(joint, isolated, atol=1e-6, rtol=1e-6)
+    reordered = tower([features[2], features[0], features[1]], "loop_ab2", level_indices=[2, 0, 1])
+    counts = [point.shape[-1] for point in points]
+    ordered_joint = torch.cat([joint[..., sum(counts[:level]):sum(counts[:level + 1])]
+                               for level in (2, 0, 1)], dim=-1)
+    assert torch.allclose(ordered_joint, reordered, atol=1e-6, rtol=1e-6)
+    from head_sharing.model import diagnose_ab2_updates
+    diagnostic_before = {k: v.clone() for k, v in model.state_dict().items()}
+    diagnostic_rng = torch.get_rng_state().clone()
+    diagnostic = diagnose_ab2_updates(model, features)
+    assert set(diagnostic) == {"cv2", "cv3", "one2one_cv2", "one2one_cv3"}
+    assert all(len(records) == 2 and all(torch.isfinite(torch.tensor(list(record.values()))).all()
+                                          for record in records) for records in diagnostic.values())
+    assert diagnostic["cv2"][0]["h_l2"] == pytest.approx(torch.linalg.vector_norm(hidden).item())
+    assert diagnostic["cv2"][0]["alphaF_l2"] == pytest.approx(
+        torch.linalg.vector_norm(0.1 * expected_first_update).item(), rel=1e-6)
+    assert torch.equal(torch.get_rng_state(), diagnostic_rng)
+    assert all(torch.equal(v, model.state_dict()[k]) for k, v in diagnostic_before.items())
+    if variant == "step_norm":
+        state_names = set(model.state_dict())
+        assert not any(name in state_names for name in
+                       ("detect.cv2.0.norm_a.weight", "detect.cv2.0.norm_a.bias",
+                        "detect.cv2.0.norm_b.weight", "detect.cv2.0.norm_b.bias"))
+        assert all(name.count("norm_a_steps") <= 1 and name.count("norm_b_steps") <= 1 for name in state_names)
+    output = model.forward_features(features)
+    loss = sum(output[1][branch][key].square().mean()
+               for branch in ("one2many", "one2one") for key in ("boxes", "scores"))
+    loss.backward()
+    for tower in towers:
+        calibrated = ([p for p in tower.norm_a_steps.parameters()] + [p for p in tower.norm_b_steps.parameters()]
+                      if variant == "step_norm" else list(tower.gain_a) + list(tower.gain_b))
+        assert calibrated and all(p.grad is not None and torch.isfinite(p.grad).all() for p in calibrated)
+    assert all(p.grad is None for p in model.detector.model[:-1].parameters())
+    if variant == "scale_gain":
+        gains = [p for tower in towers for p in (*tower.gain_a, *tower.gain_b)]
+        assert all(p.ndim == 1 for p in gains)
+        _, no_decay = optimizer_groups(model, .0005)
+        no_decay_ids = {id(p) for p in no_decay["params"]}
+        assert all(id(p) in no_decay_ids for p in gains)
+
+    trunk = {k: v.detach().clone() for k, v in model.detector.state_dict().items()
+             if k.startswith("model.") and int(k.split(".")[1]) < 23}
+    artifact = {"state_dict": trunk, "schema_version": 1, "architecture": "yolo26n",
+                "upstream": "8.4.177", "excluded_head_index": 23}
+    weights, config = tmp_path / f"{variant}.pt", tmp_path / f"{variant}.json"
+    save_checkpoint(model, weights, config, RECEIPT)
+    restored = load_checkpoint(weights, config, trunk_artifact=artifact, synthetic_trunk=True)
+    assert restored.head_spec == spec
+    expected_calibrated = model.forward_features(features)
+    actual_calibrated = restored.forward_features(features)
+    for branch in ("one2many", "one2one"):
+        for key in ("boxes", "scores"):
+            assert torch.equal(expected_calibrated[1][branch][key], actual_calibrated[1][branch][key])
+    optimizer = torch.optim.SGD(optimizer_groups(model, .0005), lr=.01)
+    resume = tmp_path / f"{variant}-resume.pt"
+    save_resume(model, optimizer, resume, epoch=0)
+    matching = HeadStudyModel("loop_ab2", 11, 32, head_spec=spec).eval()
+    matching_optimizer = torch.optim.SGD(optimizer_groups(matching, .0005), lr=.01)
+    assert load_resume(matching, matching_optimizer, resume) == 0
+    assert all(torch.equal(value, matching.state_dict()[name])
+               for name, value in model.state_dict().items())
+    matching_output = matching.forward_features(features)
+    for branch in ("one2many", "one2one"):
+        for key in ("boxes", "scores"):
+            assert torch.equal(expected_calibrated[1][branch][key], matching_output[1][branch][key])
+    wrong_variant = "scale_gain" if variant == "step_norm" else "step_norm"
+    wrong = HeadStudyModel("loop_ab2", 11, 32, head_spec={"version": 1, "variant": wrong_variant, "class_inner": 96})
+    wrong_optimizer = torch.optim.SGD(optimizer_groups(wrong, .0005), lr=.01)
+    before = {k: v.clone() for k, v in wrong.detect.state_dict().items()}
+    with pytest.raises(ValueError, match="head_spec"):
+        load_resume(wrong, wrong_optimizer, resume)
+    assert all(torch.equal(v, wrong.detect.state_dict()[k]) for k, v in before.items())
 
 
 def test_cli_help_is_available(capsys):

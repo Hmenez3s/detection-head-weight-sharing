@@ -26,12 +26,22 @@ class PointTower(nn.Module):
             nn.Conv2d(channels, width, 1),
         ) for channels in (64, 128, 256))
         self.scale_id = nn.ParameterList([nn.Parameter(torch.zeros(width)) for _ in range(3)])
-        self.norm_a = nn.LayerNorm(width, eps=1e-5)
+        if variant == "step_norm":
+            norm_a = nn.LayerNorm(width, eps=1e-5)
+            norm_b = nn.LayerNorm(width, eps=1e-5)
+            self.norm_a_steps = nn.ModuleList([norm_a, copy.deepcopy(norm_a)])
+            self.norm_b_steps = nn.ModuleList([norm_b, copy.deepcopy(norm_b)])
+        else:
+            self.norm_a = nn.LayerNorm(width, eps=1e-5)
         if arm == "loop_ab2":
-            self.norm_b = nn.LayerNorm(width, eps=1e-5)
+            if variant != "step_norm":
+                self.norm_b = nn.LayerNorm(width, eps=1e-5)
             self.a = nn.Conv2d(width, width, 1)
             self.b = nn.Conv2d(width, width, 1)
             self.passes = 2
+            if variant == "scale_gain":
+                self.gain_a = nn.ParameterList([nn.Parameter(torch.ones(width)) for _ in range(3)])
+                self.gain_b = nn.ParameterList([nn.Parameter(torch.ones(width)) for _ in range(3)])
         else:
             self.a = nn.Conv2d(width, width, 1)
             self.passes = 3
@@ -43,16 +53,28 @@ class PointTower(nn.Module):
         self.scale_bias = nn.ParameterList([nn.Parameter(torch.zeros(output)) for _ in range(3)])
 
     @staticmethod
-    def _preact(x: torch.Tensor, norm: nn.LayerNorm) -> torch.Tensor:
+    def _preact(x: torch.Tensor, norm: nn.LayerNorm, gains=None, level_indices=None, counts=None) -> torch.Tensor:
         # The channel dimension is normalized independently at every point.
-        return torch.nn.functional.silu(norm(x.permute(0, 3, 2, 1))).permute(0, 3, 2, 1)
+        normalized = norm(x.permute(0, 3, 2, 1))
+        if gains is not None:
+            calibrated = []
+            offset = 0
+            for scale, count in zip(level_indices, counts, strict=True):
+                calibrated.append(normalized[:, offset:offset + count] * gains[scale])
+                offset += count
+            normalized = torch.cat(calibrated, dim=1)
+        return torch.nn.functional.silu(normalized).permute(0, 3, 2, 1)
 
-    def _updates(self, h: torch.Tensor, arm: str, observe=None) -> torch.Tensor:
+    def _updates(self, h: torch.Tensor, arm: str, level_indices=None, counts=None, observe=None) -> torch.Tensor:
         for index in range(self.passes):
             if arm == "loop_ab2":
-                hidden = self._preact(h, self.norm_a)
+                norm_a = self.norm_a_steps[index] if self.variant == "step_norm" else self.norm_a
+                norm_b = self.norm_b_steps[index] if self.variant == "step_norm" else self.norm_b
+                gains_a = self.gain_a if self.variant == "scale_gain" else None
+                gains_b = self.gain_b if self.variant == "scale_gain" else None
+                hidden = self._preact(h, norm_a, gains_a, level_indices, counts)
                 update = self.a(hidden)
-                update = self._preact(update, self.norm_b)
+                update = self._preact(update, norm_b, gains_b, level_indices, counts)
                 update = self.b(update)
             else:
                 hidden = self._preact(h, self.norm_a)
@@ -78,7 +100,7 @@ class PointTower(nn.Module):
                             "alphaF_l2": float(scaled_norm.cpu()),
                             "ratio": float((scaled_norm / hidden_norm.clamp_min(epsilon)).cpu()),
                             "alpha": alpha})
-        self._updates(h, arm, observe)
+        self._updates(h, arm, list(range(len(features))), [point.shape[-1] for point in points], observe)
         return records
 
     def forward(self, features: list[torch.Tensor], arm: str, *, level_indices=None) -> torch.Tensor:
@@ -88,7 +110,7 @@ class PointTower(nn.Module):
             adapted = self.adapters[index](feature) + self.scale_id[index][None, :, None, None]
             points.append(adapted.flatten(2).unsqueeze(2))
         h = torch.cat(points, dim=-1)
-        h = self._updates(h, arm)
+        h = self._updates(h, arm, indices, [point.shape[-1] for point in points])
         output = self.readout(h)
         counts = [item.shape[-2] * item.shape[-1] for item in features]
         outputs = []
@@ -162,7 +184,7 @@ class HeadStudyModel(nn.Module):
         canonical_spec = canonicalize_head_spec(head_spec)
         if canonical_spec is not None and arm != "loop_ab2":
             raise ValueError("nondefault head_spec is supported only for loop_ab2")
-        if canonical_spec is not None and (canonical_spec["variant"] != "learned_alpha" or canonical_spec["class_inner"] != 96):
+        if canonical_spec is not None and (canonical_spec["variant"] not in {"learned_alpha", "step_norm", "scale_gain"} or canonical_spec["class_inner"] != 96):
             raise ValueError(f"head_spec {canonical_spec} is recognized but not implemented")
         self.head_spec = canonical_spec
         self.arm, self.seed, self.imgsz = arm, int(seed), imgsz
