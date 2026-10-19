@@ -28,23 +28,24 @@ SCALE = {"P": "#3B76C4", "M": "#E8862A", "G": "#3E9B4F"}
 SHARED = "#7B4FC9"
 INK, GREY, LINE, RULE = "#1F2430", "#6B7280", "#9CA3AF", "#E5E7EB"
 TEAL = "#0F766E"
-H80 = 7.2
+H80 = 9.0                                   # drawn height of 80 channels, as in draw_looped_head.py
+DASH = (0, (3, 2))
 
 
 def H(ch: float) -> float:
-    return H80 * ch / 80
+    return H80 * ch / 80                    # block height is proportional to channels
 
 
-def box(ax, x, y, w, h, color, text="", fs=9, alpha=0.22, lw=1.6, bold=False, tc=INK):
-    style = "round,pad=0.12,rounding_size=0.45"
+def box(ax, x, y, w, h, color, text="", fs=9, alpha=0.22, lw=1.6, bold=False, tc=INK, ls="-"):
+    style = "round,pad=0.15,rounding_size=0.5"
     ax.add_patch(FancyBboxPatch((x, y - h / 2), w, h, boxstyle=style, fc=color, ec="none", alpha=alpha, zorder=2))
-    ax.add_patch(FancyBboxPatch((x, y - h / 2), w, h, boxstyle=style, fc="none", ec=color, lw=lw, zorder=2.2))
+    ax.add_patch(FancyBboxPatch((x, y - h / 2), w, h, boxstyle=style, fc="none", ec=color, lw=lw, ls=ls, zorder=2.2))
     if text:
         ax.text(x + w / 2, y, text, ha="center", va="center", fontsize=fs, color=tc, zorder=3,
                 fontweight="bold" if bold else "normal")
 
 
-def arrow(ax, a, b, color=LINE, lw=1.3, ms=11):
+def arrow(ax, a, b, color=LINE, lw=1.3, ms=10):
     ax.add_patch(FancyArrowPatch(a, b, arrowstyle="-|>", mutation_scale=ms, color=color, lw=lw,
                                  shrinkA=0, shrinkB=0, zorder=1.5))
 
@@ -53,180 +54,195 @@ def seg(ax, xs, ys, color=LINE, lw=1.3):
     ax.plot(xs, ys, color=color, lw=lw, zorder=1.4, solid_capstyle="round")
 
 
+DESC = {"P": "64 ch \u00b7 64\u00d764", "M": "128 ch \u00b7 32\u00d732", "G": "256 ch \u00b7 16\u00d716"}
+
+
 def scale_input(ax, x, s, y):
-    box(ax, x, y, 16, 10, SCALE[s], "", alpha=0.12)
-    ax.text(x + 8, y + 1.7, s, ha="center", va="center", fontsize=14, fontweight="bold", color=SCALE[s], zorder=3)
-    desc = {"P": "64 ch \u00b7 64\u00d764", "M": "128 ch \u00b7 32\u00d732", "G": "256 ch \u00b7 16\u00d716"}[s]
-    ax.text(x + 8, y - 2.2, desc, ha="center", va="center", fontsize=8, color=INK, zorder=3)
+    box(ax, x, y, 14, 9, SCALE[s], "", alpha=0.1)
+    ax.text(x + 7, y + 1.5, s, ha="center", va="center", fontsize=13, fontweight="bold", color=SCALE[s], zorder=3)
+    ax.text(x + 7, y - 2, DESC[s], ha="center", va="center", fontsize=8, color=INK, zorder=3)
+
+
+def bn_tag(ax, cx, y, color):
+    ax.add_patch(FancyBboxPatch((cx - 1.9, y - 1.1), 3.8, 2.2, boxstyle="round,pad=0.02,rounding_size=0.3",
+                                fc=color, ec=color, lw=0, zorder=3))
+    ax.text(cx, y, "BN", ha="center", va="center", fontsize=6.6, color="white", fontweight="bold", zorder=4)
+
+
+def bias_dot(ax, cx, y, color):
+    ax.add_patch(Circle((cx, y), 1.15, fc=color, ec="white", lw=0.7, zorder=4))
+    ax.text(cx, y, "+", ha="center", va="center", fontsize=8, color="white", fontweight="bold", zorder=5)
+
+
+def chip_width(label):
+    return 0.78 * len(label) + 2.4
+
+
+def weight_chip(ax, x, y, label):
+    """The one authoritative object for a stored weight tensor."""
+    w = chip_width(label)
+    ax.add_patch(FancyBboxPatch((x, y - 1.5), w, 3.0, boxstyle="round,pad=0.02,rounding_size=0.5",
+                                fc=SHARED, ec=SHARED, lw=0, zorder=3))
+    ax.text(x + w / 2, y, label, ha="center", va="center", fontsize=7.5, color="white", fontweight="bold", zorder=4)
+    return w
+
+
+def chip_row(ax, x0, x1, y, labels):
+    widths = [chip_width(t) for t in labels]
+    gap = 1.2
+    x = (x0 + x1) / 2 - (sum(widths) + gap * (len(labels) - 1)) / 2
+    for text, w in zip(labels, widths):
+        weight_chip(ax, x, y, text)
+        x += w + gap
 
 
 def draw_architecture() -> None:
-    fig, ax = plt.subplots(figsize=(17.2, 28.6), dpi=150)
-    ax.set_xlim(0, 172)
-    ax.set_ylim(0, 286)
+    """Native head against spatial_sepbn_sharedpred, one internal copy, no recurrence.
+
+    Each scale keeps its own map end to end. A purple dashed block is one application of a
+    weight tensor stored once; a solid scale-coloured tag (BN, bias) is never shared.
+    """
+    fig, ax = plt.subplots(figsize=(15.4, 19.6), dpi=150)
+    ax.set_xlim(0, 154)
+    ax.set_ylim(0, 196)
     ax.axis("off")
     fig.patch.set_facecolor("white")
+    CX = 77
 
-    ax.text(86, 274.6, "YOLO26n detection head: native weights and shared spatial weights",
-            ha="center", va="center", fontsize=18, fontweight="bold", color=INK)
-    ax.text(86, 270.2,
-            "blue / orange / green = weights of one scale     purple = one kernel, drawn once, used by P, M and G",
-            ha="center", va="center", fontsize=11, color=GREY)
-    ax.text(86, 266.6,
-            "one internal copy is drawn (one-to-many)  \u00b7  the one-to-one copy has the same pattern and its own weights",
-            ha="center", va="center", fontsize=10.5, color=GREY)
+    ax.text(CX, 193, "YOLO26n detection head: native vs. shared spatial weights", ha="center", va="center",
+            fontsize=19, fontweight="bold", color=INK)
+    ax.text(CX, 189, "block height = number of channels   \u00b7   blue / orange / green = weights of one scale   \u00b7   "
+            "purple = weights stored once, applied at P, M and G", ha="center", va="center", fontsize=10.5, color=GREY)
+    ax.text(CX, 185.7, "one internal copy is drawn (one-to-many)  \u00b7  the one-to-one copy has the same pattern with its own weights",
+            ha="center", va="center", fontsize=10, color=GREY)
 
     def section(y, title, subtitle):
-        ax.text(86, y, title, ha="center", fontsize=15, fontweight="bold", color=INK)
-        ax.text(86, y - 3.5, subtitle, ha="center", fontsize=10.5, color=GREY)
+        ax.text(CX, y, title, ha="center", fontsize=15, fontweight="bold", color=INK)
+        ax.text(CX, y - 3.6, subtitle, ha="center", fontsize=10.5, color=GREY)
 
-    def pipeline(y, s, shared):
+    def note(x, y, head, body, grey=False):
+        ax.text(x, y, head, fontsize=10, color=INK, fontweight="bold")
+        ax.text(x, y - 1.7, body, fontsize=9.3, color=GREY if grey else INK, va="top", linespacing=1.4)
+
+    def scale_lanes(g, s, shared):
+        """One scale: its input card once, then the box lane (thin) and class lane (tall)."""
         c = SCALE[s]
-        yb, yc = y + 5.2, y - 5.0
-        box_h, cls_h = 3.5, H(80)
-        scale_input(ax, 4, s, y)
-        arrow(ax, (20.2, y + 1.2), (25.7, yb))
-        arrow(ax, (20.2, y - 1.2), (25.7, yc))
-        # Block 1 is never shared: it maps 64/128/256 channels to the tower width.
-        box(ax, 26, yb, 13, box_h, c, "3\u00d73", fs=8.5, alpha=0.55)
-        box(ax, 26, yc, 13, cls_h, c, "DW+PW", fs=8, alpha=0.28)
-        seg(ax, [39.2, 43.6], [yb, yb])
-        seg(ax, [39.2, 43.6], [yc, yc])
-        b2 = SHARED if shared else c
-        b2_ink = "white" if shared else INK
-        box(ax, 44, yb, 13, box_h, b2, "3\u00d73", fs=8.5, alpha=0.85 if shared else 0.55, tc=b2_ink, bold=shared)
-        box(ax, 44, yc, 13, cls_h, b2, "DW+PW", fs=8, alpha=0.55 if shared else 0.28, tc=b2_ink if shared else INK, bold=shared)
-        for yy in (yb, yc):
-            ax.add_patch(FancyBboxPatch((58.3, yy - 1.35), 7.2, 2.7,
-                                        boxstyle="round,pad=0.02,rounding_size=0.35",
-                                        fc=c, ec=c, lw=0, zorder=3))
-            ax.text(61.9, yy, "BN", ha="center", va="center", fontsize=7.4, color="white",
-                    fontweight="bold", zorder=4)
-        seg(ax, [57.2, 58.3], [yb, yb])
-        seg(ax, [57.2, 58.3], [yc, yc])
-        seg(ax, [65.5, 69.2], [yb, yb])
-        seg(ax, [65.5, 69.2], [yc, yc])
-        pred = SHARED if shared else c
-        pred_ink = "white" if shared else INK
-        box(ax, 69.4, yb, 8.2, box_h, pred, "1\u00d71", fs=8.5, alpha=0.9 if shared else 0.7, tc=pred_ink, bold=True)
-        box(ax, 69.4, yc, 8.2, cls_h, pred, "1\u00d71", fs=8.5, alpha=0.7 if shared else 0.4, tc=pred_ink, bold=shared)
+        yb, yc = g + 5.2, g - 1.6
+        scale_input(ax, 3, s, g)
+        arrow(ax, (17.3, g + 1), (22.8, yb))
+        arrow(ax, (17.3, g - 1), (22.8, yc))
+        box(ax, 23, yb, 7, H(16), c, alpha=0.55)
+        box(ax, 23, yc, 7, H(80), c, alpha=0.28)
+
+        def block(x, y, h, letter, w=7):
+            if shared:  # application of a stored weight: dashed purple, never solid
+                box(ax, x, y, w, h, SHARED, letter, fs=7.5, alpha=0.14, lw=1.3, bold=True, tc=SHARED, ls="--")
+            else:
+                box(ax, x, y, w, h, c, alpha=0.55 if y == yb else 0.28)
+
+        seg(ax, [30.4, 38.8], [yb, yb])
+        block(39, yb, H(16), "a")
+        seg(ax, [46.2, 48.1], [yb, yb])
+        bn_tag(ax, 50, yb, c)
+        seg(ax, [51.9, 79.3], [yb, yb])
+        block(79.5, yb, H(4), "")  # 4 output channels: too thin to hold its letter
         if shared:
-            for yy in (yb, yc):
-                ax.add_patch(Circle((80.4, yy), 1.45, fc=c, ec="white", lw=0.7, zorder=4))
-                ax.text(80.4, yy, "b", ha="center", va="center", fontsize=8, color="white",
-                        fontweight="bold", zorder=5)
-            seg(ax, [77.8, 78.9], [yb, yb])
-            seg(ax, [77.8, 78.9], [yc, yc])
-        seg(ax, [81.9, 86.6], [yb, y])
-        seg(ax, [81.9, 86.6], [yc, y])
-        arrow(ax, (86.6, y), (90.4, y))
-        ax.text(91.2, y, f"{s} predictions", va="center", fontsize=11, color=c, fontweight="bold")
+            ax.text(83, yb + 1.7, "d", ha="center", va="center", fontsize=7.5, color=SHARED, fontweight="bold")
 
-    section(261.5, "NATIVE \u2014 three separate heads", "every convolution, BatchNorm and predictor belongs to one scale")
-    ax.text(32.5, 254.6, "block 1", ha="center", fontsize=9, color=GREY)
-    ax.text(50.5, 254.6, "block 2", ha="center", fontsize=9, color=GREY)
-    ax.text(61.9, 254.6, "BN", ha="center", fontsize=9, color=GREY)
-    ax.text(73.5, 254.6, "predictor", ha="center", fontsize=9, color=GREY)
-    for s, y in (("P", 242), ("M", 220), ("G", 198)):
-        pipeline(y, s, shared=False)
-    ax.text(118, 242, "Thin track \u00b7 box", fontsize=10.5, color=INK, fontweight="bold")
-    ax.text(118, 238.2, "Conv 3\u00d73 to 16 channels, twice,\nthen 1\u00d71 to 4 box outputs.",
-            fontsize=9.5, color=INK, va="top", linespacing=1.35)
-    ax.text(118, 226, "Tall track \u00b7 class", fontsize=10.5, color=INK, fontweight="bold")
-    ax.text(118, 222.2, "Depthwise 3\u00d73 plus pointwise 1\u00d71\nto 80 channels, twice, then\n1\u00d71 to 80 class outputs.",
-            fontsize=9.5, color=INK, va="top", linespacing=1.35)
-    ax.text(118, 204.5, "The colored BN tag is that scale's\nBatchNorm. In the native head the\nblock-2 kernel is also per scale.",
-            fontsize=9, color=GREY, va="top", linespacing=1.35)
-    seg(ax, [5, 167], [184.5, 184.5], RULE, 1.2)
+        seg(ax, [30.4, 38.8], [yc, yc])
+        block(39, yc, H(80), "b")
+        seg(ax, [46.2, 48.1], [yc, yc])
+        bn_tag(ax, 50, yc, c)
+        seg(ax, [51.9, 53.3], [yc, yc])
+        block(53.5, yc, H(80), "c")
+        seg(ax, [60.7, 62.2], [yc, yc])
+        bn_tag(ax, 64.1, yc, c)
+        seg(ax, [66, 79.3], [yc, yc])
+        block(79.5, yc, H(80), "e")
 
-    section(176, "SPATIAL_SEPBN_SHAREDPRED \u2014 one kernel for P, M and G",
-            "the purple block is one weight tensor, executed once per scale \u00b7 BatchNorm and predictor bias stay per scale")
+        for y in (yb, yc):
+            seg(ax, [86.7, 94.2], [y, y])
+            bias_dot(ax, 95.4, y, c)
+            seg(ax, [96.7, 102], [y, g])
+        arrow(ax, (102, g), (105.4, g))
+        ax.text(106.2, g, f"{s} predictions", va="center", fontsize=10, color=c, fontweight="bold")
 
-    def chip(x, y, color, label):
-        ax.add_patch(FancyBboxPatch((x, y - 1.35), 7.4, 2.7,
-                                    boxstyle="round,pad=0.02,rounding_size=0.35",
-                                    fc=color, ec=color, lw=0, zorder=3))
-        ax.text(x + 3.7, y, label, ha="center", va="center", fontsize=7.4, color="white",
-                fontweight="bold", zorder=4)
+    # ------------------------------------------------------------ NATIVE
+    T = 179
+    section(T, "NATIVE \u2014 three separate heads", "every conv, BatchNorm and predictor belongs to one scale  \u00b7  "
+            "each head runs on its own map")
+    for x, t in ((26.5, "block 1"), (56, "block 2  (conv + BN)"), (89, "predictor  1\u00d71 + bias")):
+        ax.text(x, T - 10, t, ha="center", fontsize=9, color=GREY)
+    for s, dy in (("P", -19), ("M", -35), ("G", -51)):
+        scale_lanes(T + dy, s, shared=False)
+    note(123, T - 14.5, "thin row \u00b7 box", "conv 3\u00d73 \u2192 16 ch, twice,\nthen 1\u00d71 \u2192 4 box outputs")
+    note(123, T - 24, "tall row \u00b7 class", "separable 3\u00d73 \u2192 80 ch, twice,\nthen 1\u00d71 \u2192 80 class outputs")
+    ax.text(123, T - 33, "each separable block = DW 3\u00d73 + PW 1\u00d71,\neach followed by BN (two BN in the\n"
+            "tall row's block 2)", fontsize=9, color=GREY, va="top", linespacing=1.4)
+    ax.text(123, T - 42, "Nothing is shared: block 2 and the\npredictor weight are also per scale.",
+            fontsize=9, color=GREY, va="top", linespacing=1.4)
+    seg(ax, [5, 151], [T - 61, T - 61], RULE, 1.2)
 
-    def shared_family(rows, kernel_text, pred_text, kind):
-        ys = [y for _, y in rows]
-        lo, hi, mid = ys[-1], ys[0], ys[1]
-        for s, y in rows:
-            c = SCALE[s]
-            scale_input(ax, 4, s, y)
-            arrow(ax, (20.3, y), (24.7, y), c, lw=1.4)
-            box(ax, 25, y, 13, 4.2, c, "block 1", fs=8, alpha=0.42)
-            seg(ax, [38.2, 43], [y, y], c, 1.6)
-        seg(ax, [43, 43], [lo, hi], SHARED, 2.0)
-        arrow(ax, (43, mid), (47.5, mid), SHARED, lw=1.8, ms=12)
-        box(ax, 48, mid, 16, 9.2, SHARED, kernel_text, fs=8.2, alpha=0.22, tc=SHARED, bold=True, lw=2.4)
-        seg(ax, [64.2, 69], [mid, mid], SHARED, 2.0)
-        seg(ax, [69, 69], [lo, hi], LINE, 1.5)
-        for s, y in rows:
-            c = SCALE[s]
-            seg(ax, [69, 72.6], [y, y], c, 1.4)
-            chip(72.8, y, c, "BN")
-            seg(ax, [80.4, 84.5], [y, y], c, 1.4)
-        seg(ax, [84.5, 84.5], [lo, hi], SHARED, 2.0)
-        arrow(ax, (84.5, mid), (88.8, mid), SHARED, lw=1.8, ms=12)
-        box(ax, 89, mid, 14, 8.2, SHARED, pred_text, fs=8.2, alpha=0.28, tc=SHARED, bold=True, lw=2.4)
-        seg(ax, [103.2, 108], [mid, mid], SHARED, 2.0)
-        seg(ax, [108, 108], [lo, hi], LINE, 1.5)
-        for s, y in rows:
-            c = SCALE[s]
-            seg(ax, [108, 111.6], [y, y], c, 1.4)
-            ax.add_patch(Circle((113.4, y), 1.55, fc=c, ec="white", lw=0.7, zorder=4))
-            ax.text(113.4, y, "b", ha="center", va="center", fontsize=8, color="white",
-                    fontweight="bold", zorder=5)
-            arrow(ax, (115.1, y), (118.4, y), c, lw=1.3)
-            ax.text(119.2, y, f"{s} {kind}", va="center", fontsize=10.5, color=c, fontweight="bold")
+    # ------------------------------------------------------------ SHARED
+    T2 = 112.5
+    section(T2, "SPATIAL_SEPBN_SHAREDPRED \u2014 block-2 kernels and predictor weight shared by P, M and G",
+            "not looped  \u00b7  the three maps stay separate  \u00b7  BatchNorm and predictor bias stay per scale")
+    ax.text(26.5, T2 - 10.5, "block 1 \u00b7 own", ha="center", fontsize=9, color=GREY)
+    ax.text(97.5, T2 - 10.5, "own bias", ha="center", fontsize=9, color=GREY)
+    top, bottom = T2 - 8, T2 - 66.5
+    for x0, x1, title in ((34, 70, "block 2 \u00b7 shared kernels"), (73.5, 92.5, "predictor weight")):
+        ax.add_patch(FancyBboxPatch((x0, bottom), x1 - x0, top - bottom, boxstyle="round,pad=0.2,rounding_size=1.5",
+                                    fc="#F6F2FD", ec=SHARED, lw=1.2, ls="--", zorder=0.8))
+        ax.text((x0 + x1) / 2, top - 2.4, title, ha="center", fontsize=9.5, color=SHARED, fontweight="bold")
+    for s, dy in (("P", -21), ("M", -37), ("G", -53)):
+        scale_lanes(T2 + dy, s, shared=True)
+    chip_row(ax, 34, 70, T2 - 63.3, ["a box 3\u00d73", "b class DW", "c class PW"])
+    chip_row(ax, 73.5, 92.5, T2 - 63.3, ["d box", "e class"])
 
-    ax.text(31.5, 166.5, "own", ha="center", fontsize=9, color=GREY)
-    ax.text(56, 166.5, "one kernel", ha="center", fontsize=9, color=SHARED, fontweight="bold")
-    ax.text(76.5, 166.5, "own BN", ha="center", fontsize=9, color=GREY)
-    ax.text(96, 166.5, "one kernel", ha="center", fontsize=9, color=SHARED, fontweight="bold")
-    ax.text(113.4, 166.5, "own bias", ha="center", fontsize=9, color=GREY)
-    ax.text(8, 156 + 8.2, "box", fontsize=10, color=INK, fontweight="bold")
-    shared_family((("P", 156), ("M", 141), ("G", 126)), "one 3\u00d73", "one 1\u00d71", "boxes")
-    ax.text(86, 114.5, "Class family \u2014 separate kernels from the box family, same sharing pattern",
-            ha="center", fontsize=11, color=INK, fontweight="bold")
-    shared_family((("P", 100), ("M", 84), ("G", 68)), "one DW\n+ one PW", "one 1\u00d71", "classes")
-    ax.text(86, 58.6,
-            "Box and class are not tied. Block 1 stays per scale because P, M and G do not have the same channel count. "
-            "The one-to-one head repeats this pattern with its own kernels.",
-            ha="center", fontsize=9, color=GREY)
-    seg(ax, [5, 167], [54.2, 54.2], RULE, 1.2)
+    note(123, T2 - 14.5, "one kernel, three maps",
+         "each stored tensor is applied to the\nP, M and G maps separately, with\nthe same weight values")
+    note(123, T2 - 26, "still per scale", "block 1, every BatchNorm and the\npredictor bias")
+    note(123, T2 - 35.5, "not tied to each other", "box and class families, and the\none-to-many and one-to-one heads")
+    note(123, T2 - 44.5, "no recurrence", "no loop, feedback, concat or sum of\nthe P, M and G maps")
 
-    ax.text(86, 41.2, "One location in the class tower", ha="center", fontsize=13, fontweight="bold", color=INK)
+    ly = T2 - 71.5
+    weight_chip(ax, 5, ly, "stored weight")
+    ax.text(5 + chip_width("stored weight") + 1.2, ly, "one tensor, drawn once", va="center", fontsize=8.5, color=GREY)
+    box(ax, 44, ly, 7, 2.4, SHARED, "x", fs=7, alpha=0.14, lw=1.2, bold=True, tc=SHARED, ls="--")
+    ax.text(52.5, ly, "one application of it, on one scale's map", va="center", fontsize=8.5, color=GREY)
+    bn_tag(ax, 93, ly, SCALE["M"])
+    ax.text(95.6, ly, "per-scale BN", va="center", fontsize=8.5, color=GREY)
+    bias_dot(ax, 110.5, ly, SCALE["M"])
+    ax.text(112.2, ly, "bias", va="center", fontsize=8.5, color=GREY)
+    arrow(ax, (123, ly), (129, ly))
+    ax.text(130.2, ly, "lanes stay per scale", va="center", fontsize=8.5, color=GREY)
 
-    def path(y, label, steps, note):
-        ax.text(5, y + 4.6, label, fontsize=10, fontweight="bold", color=INK)
-        box(ax, 5, y, 8, 4.2, SCALE["P"], "in", fs=8, alpha=0.15)
-        x = 16.5
-        for text, color, w in steps:
-            arrow(ax, (x - 3.2, y), (x - 0.2, y))
-            tc = SHARED if color == SHARED else INK
-            box(ax, x, y, w, 4.4, color, text, fs=8, alpha=0.32, tc=tc, bold=color == SHARED)
-            x += w + 3.4
-        ax.text(x + 1, y, note, va="center", fontsize=9.2, color=GREY)
+    ax.text(CX, T2 - 76.4,
+            "The P, M and G maps (64 ch 64\u00d764, 128 ch 32\u00d732, 256 ch 16\u00d716 at 512 px) stay separate: the same stored "
+            "kernel is applied to each one on its own.\n"
+            "Class block 2 stores two tensors, b (depthwise 3\u00d73) and c (pointwise 1\u00d71), each followed by its own per-scale BN. "
+            "The predictor shares its weight, not its bias.",
+            ha="center", va="top", fontsize=9, color=GREY, linespacing=1.5)
+    seg(ax, [5, 151], [27.8, 27.8], RULE, 1.2)
 
-    path(30.5, "native",
-         [("block 1 \u00b7 own", SCALE["P"], 18), ("block 2 \u00b7 own", SCALE["P"], 18), ("1\u00d71 \u00b7 own", SCALE["P"], 14)],
-         "three scale-specific stages")
-    path(18.5, "shared spatial",
-         [("block 1 \u00b7 own", SCALE["P"], 18), ("block 2 \u00b7 shared", SHARED, 20), ("1\u00d71 \u00b7 shared", SHARED, 16)],
-         "same later kernels at P, M and G; own BN and predictor bias")
+    # ------------------------------------------------------------ NUMBERS
+    rows = [("", "native", "spatial_sepbn_sharedpred"),
+            ("stored once for P, M and G", "nothing", "block-2 kernels + predictor weight"),
+            ("unique head parameters, both internal branches", "309,656", "246,104"),
+            ("head ConvMACs, 512 px, batch 1", "384,606,208", "384,606,208"),
+            ("full detector ConvMACs", "1,906,679,808", "1,906,679,808")]
+    ax.add_patch(FancyBboxPatch((8, 8.4), 138, 17.4, boxstyle="round,pad=0.2,rounding_size=1",
+                                fc="#F9FAFB", ec=RULE, lw=1, zorder=0.5))
+    for i, row in enumerate(rows):
+        yy = 23.6 - i * 3.3
+        ax.text(60, yy, row[0], ha="right", va="center", fontsize=10, color=INK, fontweight="bold")
+        for xc, txt, col in zip((86, 121), row[1:], (SCALE["P"], SHARED)):
+            ax.text(xc, yy, txt, ha="center", va="center", fontsize=10, color=col if i == 0 else INK,
+                    fontweight="bold" if i == 0 else "normal")
+    ax.text(CX, 5.4, "The shared kernel is still executed once per scale, so the ConvMAC count does not fall. "
+            "Counts are convolution multiply-adds only.", ha="center", va="center", fontsize=8.6, color=GREY)
 
-    ax.text(86, 10.6,
-            "The shared kernel is still executed once per scale, so the ConvMAC count does not fall. "
-            "Unique head parameters: 309,656 native, 246,104 shared.",
-            ha="center", fontsize=9.5, color=GREY)
-    ax.text(86, 7.2,
-            "Head ConvMACs at 512 px, batch 1: 384,606,208 for both. Full detector: 1,906,679,808 for both.",
-            ha="center", fontsize=9.5, color=GREY)
-
-    fig.savefig(ASSETS / "shared-spatial-head.png", dpi=150, facecolor="white")
+    fig.savefig(ASSETS / "shared-spatial-head.png", dpi=150, facecolor="white", bbox_inches="tight", pad_inches=0.25)
     plt.close(fig)
 
 
