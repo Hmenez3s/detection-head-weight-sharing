@@ -1,43 +1,32 @@
-# Same compute, 20.5% fewer head parameters, +2.10% development mAP
+# Spatial Weight Sharing in a YOLO26n Detection Head
 
-**Result.** On the frozen YOLO26n trunk, one detection head shares its later convolution weights and its predictor kernels across the P, M and G scales, while each scale keeps its own BatchNorm. Against the native three-head YOLO26n, that head raised development AP50:95 by **2.10%** (**+0.319 points**) and removed **20.5%** of the unique head parameters. The ConvMAC count did not change. The gain was positive in **5 of 5** paired seeds.
+![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-0f766e)
+![Dataset: COCO subset](https://img.shields.io/badge/dataset-COCO%20subset-334155)
+![Metric: development AP50:95](https://img.shields.io/badge/metric-development%20AP50%3A95-334155)
+![Paired seeds: 5](https://img.shields.io/badge/paired%20seeds-5-0f766e)
 
-| Development AP50:95 ×100, mean ± sample SD, 5 paired seeds | `native` | `spatial_sepbn_sharedpred` |
+A controlled comparison of detection heads on one frozen YOLO26n trunk. The native head gives P, M and G their own weights. The selected head, `spatial_sepbn_sharedpred`, uses one convolution kernel for the three scales in the later block, and one predictor kernel, while each scale keeps its own BatchNorm. On the development split the paired difference is **+0.319 AP50:95 points** (15.492 versus 15.173, ×100), positive in 5 of 5 seeds, with **246,104** unique head parameters against **309,656**. Counted ConvMACs do not change. This page reports that development comparison. It is not a COCO val2017 result.
+
+## Result at a glance
+
+Development AP50:95 ×100. Five paired head seeds, 11, 22, 33, 44 and 55. Every fit ran 40 epochs. The checkpoint is the earliest best development score, measured every 5 epochs.
+
+| | `native` | `spatial_sepbn_sharedpred` |
 |---|---:|---:|
-| **AP50:95** | 15.173 ± 0.151 | **15.492 ± 0.165** |
-| Paired difference vs `native` | n/a | **+0.319 pp** |
-| Sample SD of that difference | n/a | 0.206 |
-| 95% t interval, df = 4 | n/a | [+0.062, +0.575] |
-| Seeds above native | n/a | **5 of 5** |
+| Development AP50:95, mean ± sample SD | 15.173 ± 0.151 | **15.492 ± 0.165** |
+| Paired difference vs `native` | | **+0.319** |
+| Sample SD of that difference | | 0.206 |
+| 95% t interval, df = 4 | | [+0.062, +0.575] |
+| Seeds above native | | **5 of 5** |
 | Unique head parameters, both internal branches | 309,656 | **246,104 (−20.5%)** |
-| Head ConvMACs, 512 px, batch 1 | 384.606 M | 384.606 M (**0%**) |
-| Full-detector ConvMACs, 512 px, batch 1 | 1,906.680 M | 1,906.680 M (**0%**) |
+| Head ConvMACs, 512 px, batch 1 | 384,606,208 | 384,606,208 (**0%**) |
+| Full-detector ConvMACs, 512 px, batch 1 | 1,906,679,808 | 1,906,679,808 (**0%**) |
 
-AP values are ×100, same convention as the rest of this repository. The interval describes these five paired seeds after the head was chosen on the first two of them. It is not a COCO val2017 result and not a claim about unseen images. Details and the exact values are below.
+Seeds 11 and 33 chose the head. Seeds 22, 44 and 55 were new fits of that already chosen head and of new native controls. Those three confirmation seeds average **+0.387** points. The interval describes these five paired seeds. It is not an estimate for unseen images.
 
-## What changed
-
-YOLO26n detects from three scales, P, M and G. The native head gives each scale its own weights. The new head keeps the first block of every scale native, then shares the later weights:
-
-```text
-Native, one scale family:
-  P → first block → its own later kernel / its own BN → its own predictor + bias
-  M → first block → its own later kernel / its own BN → its own predictor + bias
-  G → first block → its own later kernel / its own BN → its own predictor + bias
-
-spatial_sepbn_sharedpred:
-  P → first block → shared later kernel / its own BN → shared predictor + its own bias
-  M → first block → shared later kernel / its own BN → shared predictor + its own bias
-  G → first block → shared later kernel / its own BN → shared predictor + its own bias
-```
-
-Box and class stay separate. The one-to-many and one-to-one branches stay separate. Nothing is shared across those four families. Inside one family, the shared kernel is still executed once per scale, so the operation count does not fall. What falls is the number of unique weights: **309,656 → 246,104**.
-
-BatchNorm is the part that stays per scale: affine weights, bias, and the running statistics. The predictor kernel is shared, and the predictor bias is not. That is the whole difference from native. No width change, no extra loop, no 5×5 kernel.
-
-## Five-seed development accuracy
-
-Five head seeds, 11, 22, 33, 44 and 55. Every fit ran 40 epochs. The checkpoint is the earliest best development AP50:95, measured every 5 epochs. A selected epoch of 35 means that checkpoint scored best, not that training stopped early.
+<p align="center">
+  <img src="results/shared-spatial/paired.svg" width="100%" alt="Left: development AP50:95 for native and spatial_sepbn_sharedpred at seeds 11, 22, 33, 44 and 55, joined per seed. The shared head is above native at every seed. Right: the five paired differences, all positive, and the mean with its 95% t interval.">
+</p>
 
 | Seed | `native` | `spatial_sepbn_sharedpred` | Difference | Selected epochs |
 |---:|---:|---:|---:|---|
@@ -48,13 +37,15 @@ Five head seeds, 11, 22, 33, 44 and 55. Every fit ran 40 epochs. The checkpoint 
 | 55 | 14.934 | 15.576 | **+0.642** | 35 / 40 |
 | **Mean** | **15.173** | **15.492** | **+0.319** | |
 
-Seeds 11 and 33 were the screen that chose this head. Seeds 22, 44 and 55 were new fits of the already chosen head and of fresh native controls. Those three confirmation seeds average **+0.387 points**, so the gain is not only the two seeds that picked the winner.
+A selected epoch of 35 means that checkpoint had the best development score. Training still ran through epoch 40. Rows: [`results/shared-spatial/five_seed.csv`](results/shared-spatial/five_seed.csv).
 
-Mean paired difference **+0.319 points**, sample SD **0.206**, 95% t interval with df = 4 **[+0.062, +0.575]**. All five differences are positive. Exact rows: [`results/shared-spatial/five_seed.csv`](results/shared-spatial/five_seed.csv).
+### How the head was chosen
 
-## How this head was chosen
+Six heads, seeds 11 and 33 only. The untied row copies the shared initialization and then trains separate weights. It is a control and could not win. The registered rule keeps the candidate with a strictly positive paired development mean. No other candidate was retrained.
 
-Six heads were screened on seeds 11 and 33 only. The untied row copies the shared head's initialization but does not share weights. It is a control and could not win. The winner is the registered candidate with a strictly positive paired development mean. No other candidate was retrained.
+<p align="center">
+  <img src="results/shared-spatial/screen.svg" width="92%" alt="Development AP difference versus native on seeds 11 and 33. GroupNorm is below zero on both seeds. The 5×5 kernel is slightly below zero. Separate-BN sharing is above zero. The shared predictor, drawn in purple, has the highest paired mean and is the only head trained on the remaining seeds.">
+</p>
 
 | Head | Unique parameters | Mean AP, seeds 11 and 33 | vs `native` |
 |---|---:|---:|---:|
@@ -65,45 +56,64 @@ Six heads were screened on seeds 11 and 33 only. The untied row copies the share
 | Shared later conv, separate BN, 5×5 | 282,712 | 15.191 | −0.075 |
 | **Shared later conv, separate BN, shared predictor** | **246,104** | **15.481** | **+0.216** |
 
-GroupNorm and the 5×5 kernel were worse than native on both screen seeds. Sharing the later convolutions alone was already a little higher than native. Sharing the predictor kernel as well was higher still, and it is the head in the five-seed table. Screen rows: [`results/shared-spatial/screen.csv`](results/shared-spatial/screen.csv).
+GroupNorm and the 5×5 kernel were below native on this screen. Sharing the later convolutions and keeping BatchNorm was above native. Sharing the predictor kernel as well was the selected head. Screen rows: [`results/shared-spatial/screen.csv`](results/shared-spatial/screen.csv).
 
-## Compute
+### Parameters and counted compute
 
-Counted on the selected seed-11 checkpoints at 512 px, with this repository's convolution counter. One MAC is one multiply-accumulate. Normalization, activation, pooling and decoding are not counted.
+<p align="center">
+  <img src="results/shared-spatial/compute.svg" width="88%" alt="Two bar charts. Unique head parameters fall from 309,656 to 246,104, a 20.5% reduction. Head ConvMACs at 512 px and batch 1 stay at 384,606,208 for both heads.">
+</p>
 
-| | `native` | `spatial_sepbn_sharedpred` |
-|---|---:|---:|
-| Unique head parameters | 309,656 | 246,104 |
-| Head ConvMACs, batch 1 | 384,606,208 | 384,606,208 |
-| Full detector ConvMACs, batch 1 | 1,906,679,808 | 1,906,679,808 |
-| Convolutions executed, head / full detector | 48 / 126 | 48 / 126 |
+The shared kernel is still executed once per scale, so the operation count does not fall. The parameter count falls because P, M and G store that kernel once. Normalization, activation and decoding are not in the ConvMAC count. Latency and peak memory on the training GPU were not measured for this head.
 
-The head is 20.2% of the detector's ConvMACs. Those MACs stay, because each scale still runs the shared kernel. The parameter cut is storage, not fewer operations.
+## Architecture
 
-Latency and peak memory on the training GPU were **not measured** for this head. There is no speed claim.
+<p align="center">
+  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n detection head. Top, native: P, M and G each keep their own block-1 convolution, block-2 convolution, BatchNorm and predictor. Bottom, spatial_sepbn_sharedpred: block 1 stays per scale; the block-2 kernel and the predictor kernel are purple, one object for all three scales; BatchNorm and the predictor bias stay in the scale color. Box and class are separate tracks. One one-to-many copy is drawn.">
+</p>
 
-## Method
+YOLO26n detects from three maps. P is 64 channels at 64×64, M is 128 channels at 32×32, and G is 256 channels at 16×16, at 512 px. Each map has a box branch and a class branch. The detector also has a second internal copy of those branches, the one-to-one head. The figure draws the one-to-many copy. The one-to-one copy has the same pattern and its own weights. Nothing is shared across box and class, or across the two copies.
 
-- **Same trunk as the published looped-head study.** One frozen YOLO26n trunk, artifact SHA-256 `f01ec41445fac9ef7078b48ef1b73473e6314bcb1a77e77c20666d6ecfcd9016`, shared with [v0.2.0](https://github.com/Hmenez3s/detection-head-weight-sharing/releases/tag/v0.2.0). It was trained from scratch on the reduced COCO train split. These seeds are five heads on that trunk, not five backbones.
-- **Frozen features.** Only the head is trained, on cached 512 px features. This is not end-to-end training.
-- **Fixed dose.** 40 epochs, batch 32, development AP every 5 epochs, 2,000-image development split for selection, 1,000-image training probe. The probe is not held-out accuracy.
-- **Eighteen closed fits, no failures.** Twelve screen fits (six heads × seeds 11 and 33) and six confirmation fits (`native` and the winner × seeds 22, 44 and 55). Every fit ran on one RTX 5070 Ti from commit `4272ae2`.
-- **No COCO val2017 score.** This study did not run the holdout. Development AP selected the checkpoint and the head, so it is the measurement used to make those choices.
+The box branch is two 3×3 convolutions to 16 channels, then a 1×1 predictor to 4 outputs. The class branch is two separable blocks, each a depthwise 3×3 and a pointwise 1×1, to 80 channels, then a 1×1 predictor to 80 classes. Block 1 is what changes width. It stays per scale in every spatial variant, because the three maps do not enter with the same number of channels.
 
-## What this number is not
+`spatial_sepbn_sharedpred` ties two things inside each family:
 
-- **Not the published val2017 number.** On COCO val2017 the native head of the earlier study scored 14.333. The 15.173 here is development AP on a different split. Do not subtract them.
-- **Not proof on unseen images.** The development split chose both the checkpoint and, for two of the five seeds, the head. The three confirmation seeds were not used to choose the head, and they were positive too. That still is not val2017.
-- **Not a speed result.** ConvMACs are unchanged. GPU latency was not measured.
-- **One trunk, five seeds.** The interval is wide: the lower end is +0.062 points.
-- **The screen spent its comparisons.** GroupNorm and 5×5 lost on two seeds and were not retrained. The untied control matches initialization of the shared convolutions only. It does not isolate every difference in the predictor.
-- **Scope.** YOLO26n, one COCO subset, 512 px, frozen features, this recipe. No retune and no longer training.
+- the block-2 convolution weights, one kernel executed at P, M and G;
+- the predictor kernel, with a separate bias at each scale.
 
-## Previous result
+BatchNorm stays per scale: affine weight, bias, and the running statistics. That is the whole difference from native. Width, depth and kernel size are unchanged.
 
-The previous experiment in this repository asked a different question and got a negative answer. A looped head shared by P, M and G lost to native on COCO val2017: **14.333 vs 13.744 (−0.589 points)** for `loop_ab2`, and **13.600 (−0.733)** for `loop_a3`, each worse in 5 of 5 seeds. Those loops also used about 64% more head ConvMACs. That result is unchanged and is written up in [docs/looped-result.md](docs/looped-result.md). Release [v0.2.0](https://github.com/Hmenez3s/detection-head-weight-sharing/releases/tag/v0.2.0) has its checkpoints and evidence.
+The other screened heads move only that tied part. `spatial_sepbn` shares the block-2 convolution and not the predictor. `spatial_gn` replaces the three BatchNorms with one GroupNorm. `spatial_sepbn_k5` widens the shared 3×3 to 5×5. `spatial_untied` starts from the shared initialization and then keeps separate weights.
 
-The head above does not repeat that design. It keeps the native blocks, shares compatible weights, and leaves BatchNorm per scale.
+## Protocol
+
+| Item | Value |
+|---|---|
+| Trunk | Frozen YOLO26n, artifact SHA-256 `f01ec41445fac9ef7078b48ef1b73473e6314bcb1a77e77c20666d6ecfcd9016`. The same trunk as the published looped-head study. |
+| What is trained | The head only, on cached 512 px features. Not end-to-end training. |
+| Dose | 40 epochs, batch 32, development AP every 5 epochs. |
+| Selection | Earliest best development AP50:95. The 1,000-image training probe is not held-out accuracy. |
+| Fits | 18 closed fits, no failures. Twelve screen fits, then six confirmation fits. |
+| Code | Commit `4272ae2`, one RTX 5070 Ti. |
+| Not run | COCO val2017. The holdout was not scored. |
+
+The development split was used both to pick the checkpoint and, through seeds 11 and 33, to pick the head. The confirmation seeds were not used to pick the head. They are still development seeds, not val2017.
+
+## Previous published result
+
+The previous study asked a different question and got a negative answer. One looped head shared by P, M and G lost to the three native heads on COCO val2017: **14.333 versus 13.744 (−0.589)** for `loop_ab2`, and **13.600 (−0.733)** for `loop_a3`, each worse in 5 of 5 seeds. Those loops also used about 64% more head ConvMACs. That result is unchanged. The figure below is the architecture drawing from that study. It is not the head in the table above.
+
+<p align="center">
+  <img src="assets/looped-head.png" width="100%" alt="YOLO26n detection head from the published looped-head study. Top, native: separate P, M and G heads, two blocks per box and class branch. Middle, loop_ab2: a per-scale adapter, then one shared two-layer loop applied twice. Bottom, loop_a3: a per-scale adapter, then one shared layer applied three times. Purple marks weights shared by P, M and G.">
+</p>
+
+The writeup, the val2017 table and the paired-difference and training-curve figures are in [docs/looped-result.md](docs/looped-result.md). Release [v0.2.0](https://github.com/Hmenez3s/detection-head-weight-sharing/releases/tag/v0.2.0) has the checkpoints. The head in this study does not repeat that loop. It keeps the native blocks, shares the later kernels, and leaves BatchNorm per scale.
+
+An earlier experiment, release [v0.1.0](https://github.com/Hmenez3s/detection-head-weight-sharing/releases/tag/v0.1.0), tied a refiner inside one scale rather than across scales. Its drawing is [`assets/architecture.png`](assets/architecture.png). Its results remain in [`results/`](results/). It does not answer the question on this page.
+
+<p align="center">
+  <img src="assets/architecture.png" width="100%" alt="Earlier intra-scale study. A frozen YOLO26n trunk feeds three rows with the same adapter and predictor. The second refiner differs: native applies it once, independent_k2 applies two distinct refiners, shared_k2 applies one refiner twice. Nothing is tied across scales.">
+</p>
 
 ## Build this head
 
@@ -118,6 +128,8 @@ model = HeadStudyModel(
 )
 ```
 
-`head_spec=None` is the native head. The other screened variants are `spatial_sepbn`, `spatial_gn`, `spatial_sepbn_k5`, and the non-shared control `spatial_untied`. The measured scores in this README are the committed tables, not a promise that constructing the module reproduces the fit. COCO images, feature caches and the selected checkpoints are not in this repository.
+`head_spec=None` is the native head. The other registered variants are `spatial_sepbn`, `spatial_gn`, `spatial_sepbn_k5` and `spatial_untied`. The scores above are the committed tables. Constructing the module does not reproduce the fit. COCO images, feature caches and the selected checkpoints are not in this repository.
+
+The figures are drawn by [`scripts/draw_shared_spatial.py`](scripts/draw_shared_spatial.py) from those tables. The looped-head figure is drawn by [`scripts/draw_looped_head.py`](scripts/draw_looped_head.py).
 
 Code is AGPL-3.0. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for Ultralytics YOLO26 and for COCO terms.
