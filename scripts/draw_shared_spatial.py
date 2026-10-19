@@ -18,6 +18,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 matplotlib.rcParams["svg.fonttype"] = "path"
+import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 from matplotlib.colors import same_color
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
@@ -101,97 +102,121 @@ def native_panel(ax, T):
     seg(ax, [6, 164], [T - 65, T - 65], RULE, 1.2)
 
 
-# Where each scale's lane enters and leaves a shared block: P above, M centre, G below.
-PORT = {"box": {"P": 0.55, "M": 0.0, "G": -0.55}, "class": {"P": 2.4, "M": 0.0, "G": -2.4}}
+# A map stack is the input/output glyph of the shared region: three gapped bars, P over M over G,
+# one per map. It replaces the old concat bar; a P|M|G row would claim a concat this head never does.
+MAP_W, MAP_H, MAP_GAP = 8.0, 1.0, 1.7
+MAP_DY = {"P": MAP_GAP, "M": 0.0, "G": -MAP_GAP}
+
+
+def map_stack(ax, x, yc):
+    for s, dy in MAP_DY.items():
+        ax.add_patch(FancyBboxPatch((x, yc + dy - MAP_H / 2), MAP_W, MAP_H, boxstyle="square,pad=0", fc=SCALE[s],
+                                    ec="none", alpha=0.85, zorder=3, gid=f"map:{s}"))
+    pad = 0.6
+    ax.add_patch(FancyBboxPatch((x - pad, yc - MAP_GAP - MAP_H / 2 - pad), MAP_W + 2 * pad, 2 * MAP_GAP + MAP_H + 2 * pad,
+                                boxstyle="round,pad=0,rounding_size=0.5", fc="none", ec=LINE, lw=1.0, zorder=2.6))
+    return x + MAP_W + pad                  # right edge of the tray
+
+
+def lane(ax, xs, ys, color, over=False):
+    """One scale's wire. Lanes drawn `over` carry a white halo, so a crossing reads as a hop, not a join."""
+    effects = [pe.Stroke(linewidth=6, foreground="white"), pe.Normal()] if over else None
+    ax.plot(xs, ys, color=color, lw=1.3, zorder=1.45 if over else 1.4, solid_capstyle="butt",
+            solid_joinstyle="miter", path_effects=effects)
 
 
 def shared_panel(ax, T):
     """draw_looped_head.looped_panel with the loop, scale IDs and flatten + concat taken out.
 
-    Each scale keeps its own coloured lane. The lanes enter the one purple block per tower at
-    separate ports and leave it separately, so the block is drawn once and the maps never meet.
+    The coloured lanes end on their own bar of a three-map stack; the stack passes through each
+    purple block, drawn once, and leaves as a stack again. The maps are never joined.
     """
     section(ax, T, "SPATIAL_SEPBN_SHAREDPRED \u2014 block 2 and predictor shared by P, M and G, no loop",
             "box 16 \u00b7 class 80 channels  \u00b7  box and class do not share weights  \u00b7  "
             "24 conv applications per internal copy")
-    YB, YC = T - 16, T - 39                  # box tower, class tower (one lower than draw_looped_head
-                                             # so the G class port does not line up with the M stub)
     ax.text(32, T - 8.4, "block 1 per scale, per tower: the native first block\n(64 / 128 / 256 ch \u2192 16 box, 80 class)",
             ha="center", va="bottom", fontsize=8.4, color=GREY, linespacing=1.3)
-
-    # Each lane: (colour, source y, vertical x, port y). Box verticals sit left of class verticals,
-    # so the only crossings are box verticals over class stubs; those are broken as in the old bus.
-    lanes = []
-    for s, dy, xb, xc in (("P", -20, 39.0, 43.0), ("M", -38, 39.0, 44.5), ("G", -56, 40.5, 46.0)):
+    # The P box stub and the M class stub run straight into their bars; the other lanes turn on two
+    # ordered buses (box pair left of class pair), so only class lanes ever hop over box lanes.
+    YB, YC = T - 15.4 - MAP_GAP, T - 42.4
+    XS = 46.6                                # left edge of the input stacks
+    bus = {("box", "M"): 38.2, ("box", "G"): 39.6, ("class", "P"): 42.0, ("class", "G"): 43.4}
+    for s, dy in (("P", -20), ("M", -38), ("G", -56)):
         y, c = T + dy, SCALE[s]
         scale_input(ax, 6, s, y)
         yb, yc = y + 4.6, y - 4.4
         arrow(ax, (20.3, y + 1), (26.8, yb)); arrow(ax, (20.3, y - 1), (26.8, yc))
         box(ax, 27, yb, 5, H(16), c, alpha=0.6)
         box(ax, 27, yc, 5, H(80), c, alpha=0.35)
-        lanes.append((c, yb, xb, YB + PORT["box"][s]))
-        lanes.append((c, yc, xc, YC + PORT["class"][s]))
-    stubs = [(y0, xv, i) for i, (_, y0, xv, _) in enumerate(lanes)]
-    for i, (c, y0, xv, yp) in enumerate(lanes):
-        seg(ax, [32.2, xv], [y0, y0], c, 1.2)
-        lo, hi = sorted((y0, yp))
-        cuts = sorted(ys for ys, xs, j in stubs if j != i and xs > xv and lo < ys < hi)
-        edges = [lo] + [e for v in cuts for e in (v - 0.9, v + 0.9)] + [hi]
-        for a, b in zip(edges[::2], edges[1::2]):
-            seg(ax, [xv, xv], [a, b], c, 1.2)
-        seg(ax, [xv, 70.3], [yp, yp], c, 1.2)
-    ax.text(50, YB + 2.8, "three maps, kept separate", ha="center", fontsize=8.4, color=INK, fontweight="bold")
-    ax.text(52, YB - 2.2, "P 64\u00d764 | M 32\u00d732 | G 16\u00d716", ha="center", va="top", fontsize=6.9, color=GREY)
+        for tower, y0, yt in (("box", yb, YB), ("class", yc, YC)):
+            y1 = yt + MAP_DY[s]
+            xv = bus.get((tower, s))
+            if xv is None:
+                assert abs(y1 - y0) < 1e-9, (tower, s)
+                lane(ax, [32.2, XS], [y0, y0], c, tower == "class")
+            else:
+                lane(ax, [32.2, xv, xv, XS], [y0, y0, y1, y1], c, tower == "class")
 
-    ax.add_patch(FancyBboxPatch((63, T - 56.4), 55, 51.4, boxstyle="round,pad=0.2,rounding_size=1.5",
+    ax.add_patch(FancyBboxPatch((63, T - 56.4), 46.6, 51.4, boxstyle="round,pad=0.2,rounding_size=1.5",
                                 fc="#F6F2FD", ec=SHARED, lw=1.2, ls="--", zorder=0.8))
-    ax.text(90.5, T - 7.0, "weights shared by P, M and G", ha="center", fontsize=10, color=SHARED,
-            fontweight="bold")
-    ax.text(90.5, T - 51.4, "same weights, separate maps", ha="center", fontsize=10, color=SHARED, fontweight="bold")
-    ax.text(90.5, T - 54.4, "each block runs once on P, once on M and once on G", ha="center", fontsize=9.3,
+    ax.text(86.3, T - 7.0, "weights shared by P, M and G", ha="center", fontsize=10, color=SHARED, fontweight="bold")
+    ax.text(86.3, T - 54.2, "each kernel is applied to P, M and G separately", ha="center", fontsize=9.3,
             color=SHARED)
 
-    x1, bw, xp = 70.5, 24, 106.5             # shared block, predictor
-    for yt, ch, layer, label, n_out, ports in (
-            (YB, 16, "conv 3\u00d73", "box \u00b7 shared conv 3\u00d73 \u00b7 16 ch\nthen BN + SiLU per scale", 4,
-             PORT["box"]),
-            (YC, 80, "DW 3\u00d73 + PW 1\u00d71", "class \u00b7 shared DW 3\u00d73 and PW 1\u00d71 \u00b7 80 ch\n"
-             "each followed by BN + SiLU per scale", 80, PORT["class"])):
+    bw, gap, x1, xp, xo = 10, 3.4, 67.5, 97, 114
+    for yt, ch, label, n_out, out in (
+            (YB, 16, "box \u00b7 conv 3\u00d73 \u00b7 BN + SiLU per scale \u00b7 16 ch", 4, "boxes"),
+            (YC, 80, "class \u00b7 DW 3\u00d73 \u2192 PW 1\u00d71 \u00b7 BN + SiLU per scale \u00b7 80 ch", 80, "classes")):
         h = H(ch)
-        box(ax, x1, yt, bw, h, SHARED, layer if h > 4 else "", fs=12, alpha=0.3, bold=True, tc=SHARED)
-        if h <= 4:
-            ax.text(x1 + bw / 2, yt + h / 2 + 1.5, layer, ha="center", fontsize=9.5, color=SHARED, fontweight="bold")
-        ax.text(x1 + bw / 2, yt - h / 2 - 1.8, label, ha="center", va="top", fontsize=8.4, color=SHARED,
-                linespacing=1.35)
-        hp = max(H(ch), 1.7)                 # 4 ch would be thinner than the three lanes it carries
+        tray = map_stack(ax, XS, yt)
+        if ch == 80:                         # two kernels, each its own block
+            xs = [x1, x1 + bw + gap]
+            for x, layer in zip(xs, ("DW 3\u00d73", "PW 1\u00d71")):
+                box(ax, x, yt, bw, h, SHARED, layer, fs=10.5, alpha=0.3, bold=True, tc=SHARED)
+            arrow(ax, (xs[0] + bw + 0.2, yt), (xs[1] - 0.2, yt), SHARED)
+        else:                                # one 3x3 conv, centred on the class pair
+            xs = [x1 + (bw + gap) / 2]
+            box(ax, xs[0], yt, bw, h, SHARED, alpha=0.3)
+            ax.text(xs[0] + bw / 2, yt + h / 2 + 1.5, "conv 3\u00d73", ha="center", fontsize=9.5, color=SHARED,
+                    fontweight="bold")
+        arrow(ax, (tray + 0.2, yt), (xs[0] - 0.2, yt), SHARED, lw=1.4)
+        arrow(ax, (xs[-1] + bw + 0.2, yt), (xp - 0.2, yt), SHARED)
+        ax.text(86.3, yt - h / 2 - 1.8, label, ha="center", va="top", fontsize=8.4, color=SHARED)
+
+        hp = H(n_out) + (0.4 if n_out == 4 else 0)
         box(ax, xp, yt, 3, hp, SHARED, alpha=0.55)
         ax.text(xp + 1.5, yt + hp / 2 + 1.3, f"predictor 1\u00d71 \u2192 {n_out}\nbias per scale", ha="center",
                 va="bottom", fontsize=8, color=SHARED, linespacing=1.2)
-        for s, dp in ports.items():
-            c, yy = SCALE[s], yt + dp
-            fan = yt + (dp if abs(dp) >= 2 else 2.0 * (dp > 0) - 2.0 * (dp < 0))
-            seg(ax, [x1 + bw + 0.3, xp - 0.2], [yy, yy], c, 1.2)
-            seg(ax, [xp + 3.2, 121], [yy, yy], c, 1.2)
-            seg(ax, [121, 124.5], [yy, fan], c, 1.2)
-            arrow(ax, (124.5, fan), (127.5, fan), c, lw=1.2, ms=8)
-            ax.text(128.3, fan, s, va="center", fontsize=8.5, color=c, fontweight="bold")
-        ax.text(131.8, yt, f"{'boxes' if n_out == 4 else 'classes'}, one output\nmap per scale", va="center",
-                fontsize=9.6, color=INK, fontweight="bold", linespacing=1.35)
-    ax.text(106, T - 60.8, "Block 1 is the native first block and stays per scale. Inside the purple region each weight is stored once "
-            "per family and applied\nto the P, M and G maps separately, so the three maps are never concatenated, summed or looped "
-            "and the conv count does not change.\nEvery BatchNorm and the predictor bias stay per scale. Box and class, and the "
-            "one-to-many and one-to-one copies, share nothing.",
+        seg(ax, [xp + 3.2, xo - 0.6], [yt, yt])
+        end = map_stack(ax, xo, yt)
+        arrow(ax, (end + 0.2, yt), (end + 3, yt))
+        ax.text(end + 3.8, yt, f"{out}, one output\nmap per scale", va="center", fontsize=9.6, color=INK,
+                fontweight="bold", linespacing=1.35)
+    ax.text(XS + MAP_W / 2, YB + MAP_GAP + MAP_H / 2 + 1.4, "three maps, kept separate", ha="center", fontsize=8.4,
+            color=INK, fontweight="bold")
+    ax.text(106, T - 60.8, "Block 1 is the native first block and stays per scale. Each purple kernel is stored once per family "
+            "and applied to the P, M and G maps\nseparately: the maps are never concatenated, summed or looped, so the head "
+            "keeps 24 conv applications per internal copy. Every\nBatchNorm and the predictor bias stay per scale; box and class, "
+            "and the one-to-many and one-to-one copies, share nothing.",
             ha="center", va="top", fontsize=9, color=GREY, linespacing=1.45)
     seg(ax, [6, 164], [T - 70.4, T - 70.4], RULE, 1.2)
 
 
 def _check_shared_stages(ax) -> None:
-    """Each shared stage is one purple rectangle: two blocks and two predictors, no loop circles."""
+    """Each shared stage is drawn once (box conv, class DW and PW, two predictors), with no loop
+    circles, and the maps only appear as P-over-M-over-G stacks, never as one P|M|G row."""
     outlines = [p for p in ax.patches if isinstance(p, FancyBboxPatch) and p.get_facecolor()[3] == 0
                 and same_color(p.get_edgecolor(), SHARED) and p.get_linestyle() in ("-", "solid")]
-    assert len(outlines) == 4, len(outlines)
+    assert len(outlines) == 5, len(outlines)
     assert all(type(p) in (FancyBboxPatch, FancyArrowPatch) for p in ax.patches)
     assert not any(t.get_text().startswith("\u00d7") for t in ax.texts)
+    bars = [p for p in ax.patches if (p.get_gid() or "").startswith("map:")]
+    assert len(bars) == 12 and all(same_color(p.get_facecolor()[:3], SCALE[p.get_gid()[4:]]) for p in bars)
+    for a in bars:
+        for b in bars:
+            ya, yb = a.get_y(), b.get_y()
+            if a.get_gid() != b.get_gid():  # different scales must never share a row
+                assert ya + a.get_height() <= yb or yb + b.get_height() <= ya, (a.get_gid(), b.get_gid())
 
 
 def draw_architecture() -> None:
