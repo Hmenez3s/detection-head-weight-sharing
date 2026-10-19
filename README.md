@@ -5,7 +5,23 @@
 ![Metric: development AP50:95](https://img.shields.io/badge/metric-development%20AP50%3A95-334155)
 ![Paired seeds: 5](https://img.shields.io/badge/paired%20seeds-5-0f766e)
 
-A controlled comparison of detection heads on one frozen YOLO26n trunk. The native head gives P, M and G their own weights. The selected head, `spatial_sepbn_sharedpred`, uses one convolution kernel for the three scales in the later block, and one predictor kernel, while each scale keeps its own BatchNorm. On the development split the paired difference is **+0.319 AP50:95 points** (15.492 versus 15.173, ×100), positive in 5 of 5 seeds, with **246,104** unique head parameters against **309,656**. Counted ConvMACs do not change. This page reports that development comparison. It is not a COCO val2017 result.
+A controlled comparison of detection heads on one frozen YOLO26n trunk. The native head gives P, M and G their own weights. The selected head, `spatial_sepbn_sharedpred`, shares the compatible convolution kernels in the second block and the predictor kernels across the three scales, while each scale keeps its own BatchNorm. On the development split the paired difference is **+0.319 AP50:95 points** (15.492 versus 15.173, ×100), positive in 5 of 5 seeds, with **246,104** unique head parameters against **309,656**. Counted ConvMACs do not change. This page reports that development comparison. It is not a COCO val2017 result.
+
+## How this differs from the looped head
+
+**This is a separate, non-recurrent follow-up, not an improved version of the loop.** Weight sharing and recurrence are different choices: different scales can use the same kernel without sending an output back through it.
+
+| | Previous looped heads | Current spatial-sharing head |
+|---|---|---|
+| Repeated refinement | `loop_ab2` applies the same A → B pair twice; `loop_a3` applies A three times, with residual updates. | No recurrence or extra refinement passes. |
+| Head structure | Per-scale spatial adapters, then a shared pointwise 1×1 recurrent tower and readout. | Native block sequence, widths and kernel sizes, with compatible later weights tied across scales. |
+| What is shared | Tower weights across P, M and G **and across loop passes**. | Second-block and predictor kernels across P, M and G, within each branch family. |
+| Feature maps | Adapted points are flattened into one list for the pointwise tower, then split back. | P, M and G keep their own maps; each map independently uses the same kernels. |
+| Normalization | Per-point channel LayerNorm inside the loop. | Native BatchNorm, separately at each scale. |
+
+For the new head, sharing a kernel W means applying **W(P), W(M) and W(G)** independently, not repeatedly applying **W(W(W(P)))**. Each layer has its own kernel; box, class, one-to-many and one-to-one families do not share with each other. The first block and predictor bias also stay per scale.
+
+The earlier looped results below are COCO val2017 scores; the current results are development scores. **They are not a direct new-head-versus-looped comparison on the same evaluation set.**
 
 ## Result at a glance
 
@@ -66,10 +82,23 @@ GroupNorm and the 5×5 kernel were below native on this screen. Sharing the late
 
 The shared kernel is still executed once per scale, so the operation count does not fall. The parameter count falls because P, M and G store that kernel once. Normalization, activation and decoding are not in the ConvMAC count. Latency and peak memory on the training GPU were not measured for this head.
 
+## Interpretation and limits
+
+**Measured:** against native, the selected spatial-sharing head gained **+0.319 development AP50:95 points** across five paired seeds, with a positive difference in every seed, **20.5% fewer unique head parameters** and unchanged counted ConvMACs. This supports weight sharing **without recurrence** in this specific frozen-trunk development setting; it is not evidence that a looped head improved.
+
+**Possible explanations, not established causes:**
+
+- **Learning common filters from all three scales.** Gradients from P, M and G update the same tied kernels. Combining those learning signals may encourage useful cross-scale filters rather than three independent copies.
+- **Sharing weights without sharing normalization.** Separate BatchNorm parameters and running statistics let each scale retain its own normalization despite using common convolution kernels. This may help accommodate differences between scales; native also has separate BatchNorm, so this is not a newly added capability.
+
+Relative to the earlier looped design, the new head also preserves native spatial processing rather than replacing the later head with a recurrent pointwise tower. That could affect optimization, but it is not an explanation for the measured gain over native: both native and the new head have that spatial structure.
+
+We did not isolate those mechanisms. The two-seed screen is not enough to attribute the gain to BatchNorm, predictor sharing or fewer parameters alone, and the experiments do not establish that recurrence is generally worse. A direct causal comparison would need matched evaluations and controls. The development split also selected checkpoints and the head, so the observed gain is not an unseen-data result or a GPU speed claim.
+
 ## Architecture
 
 <p align="center">
-  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n detection head. Top, native: P, M and G each keep their own convolutions, BatchNorm and predictor. Bottom, spatial_sepbn_sharedpred: each scale keeps block 1, then the three scales join one purple block-2 kernel and one purple predictor kernel. BatchNorm and the predictor bias stay in the scale color and do not join. Box and class are separate families. The shared kernel is drawn once.">
+  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n native and non-recurrent spatial-sharing heads. P, M and G retain separate feature-map paths. The second-block and predictor weights are shared across scales within each branch family; first blocks, BatchNorm and predictor biases stay scale-specific. Box and class remain separate. Weight sharing does not join feature maps or introduce a loop.">
 </p>
 
 YOLO26n detects from three maps. P is 64 channels at 64×64, M is 128 channels at 32×32, and G is 256 channels at 16×16, at 512 px. Each map has a box branch and a class branch. The detector also has a second internal copy of those branches, the one-to-one head. The figure draws the one-to-many copy. The one-to-one copy has the same pattern and its own weights. Nothing is shared across box and class, or across the two copies.
@@ -78,7 +107,7 @@ The box branch is two 3×3 convolutions to 16 channels, then a 1×1 predictor to
 
 `spatial_sepbn_sharedpred` ties two things inside each family:
 
-- the block-2 convolution weights, one kernel executed at P, M and G;
+- the block-2 convolution weights: one shared 3×3 kernel in the box branch, and a shared depthwise kernel plus a separate shared pointwise kernel in the class branch, each executed independently at P, M and G;
 - the predictor kernel, with a separate bias at each scale.
 
 BatchNorm stays per scale: affine weight, bias, and the running statistics. That is the whole difference from native. Width, depth and kernel size are unchanged.
