@@ -69,7 +69,7 @@ The shared kernel is still executed once per scale, so the operation count does 
 ## Architecture
 
 <p align="center">
-  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n detection head. Top, native: P, M and G each keep their own block-1 convolution, block-2 convolution, BatchNorm and predictor. Bottom, spatial_sepbn_sharedpred: block 1 stays per scale; the block-2 kernel and the predictor kernel are purple, one object for all three scales; BatchNorm and the predictor bias stay in the scale color. Box and class are separate tracks. One one-to-many copy is drawn.">
+  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n detection head. Top, native: P, M and G each keep their own convolutions, BatchNorm and predictor. Bottom, spatial_sepbn_sharedpred: each scale keeps block 1, then the three scales join one purple block-2 kernel and one purple predictor kernel. BatchNorm and the predictor bias stay in the scale color and do not join. Box and class are separate families. The shared kernel is drawn once.">
 </p>
 
 YOLO26n detects from three maps. P is 64 channels at 64×64, M is 128 channels at 32×32, and G is 256 channels at 16×16, at 512 px. Each map has a box branch and a class branch. The detector also has a second internal copy of those branches, the one-to-one head. The figure draws the one-to-many copy. The one-to-one copy has the same pattern and its own weights. Nothing is shared across box and class, or across the two copies.
