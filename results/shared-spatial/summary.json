@@ -1,0 +1,41 @@
+{
+  "metric": "development AP50:95 x100",
+  "not_coco_val2017": true,
+  "trunk_artifact_sha256": "f01ec41445fac9ef7078b48ef1b73473e6314bcb1a77e77c20666d6ecfcd9016",
+  "source_commit": "4272ae2d2e72dbea18c2f05a142fe7fb005d469e",
+  "winner": "spatial_sepbn_sharedpred",
+  "fits_completed": 18,
+  "failures": 0,
+  "epochs_executed": 40,
+  "selection": {
+    "cohort": "dev",
+    "metric": "AP50:95",
+    "cadence_epochs": 5,
+    "tie": "earliest"
+  },
+  "native_mean": 15.173068345010218,
+  "sharedpred_mean": 15.491572311026044,
+  "native_sample_sd": 0.15115044572862332,
+  "sharedpred_sample_sd": 0.16454436193804226,
+  "paired_mean_pp": 0.3185039660158262,
+  "paired_sample_sd_pp": 0.20625670486208278,
+  "paired_t95_df4_pp": [
+    0.06240244120043825,
+    0.5746054908312141
+  ],
+  "relative_mean_gain": 0.02099140126265685,
+  "confirmation_seeds_mean_delta_pp": 0.3868120675258065,
+  "positive_seeds": 5,
+  "head_parameters": {
+    "native": 309656,
+    "sharedpred": 246104,
+    "reduction": 0.20523419536517942
+  },
+  "conv_macs_512_batch1": {
+    "full": 1906679808,
+    "head": 384606208,
+    "delta": 0
+  },
+  "gpu_latency_measured": false,
+  "holdout_scored": false
+}

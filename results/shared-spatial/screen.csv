@@ -1,0 +1,7 @@
+variant,description,unique_head_parameters,seed11_ap50_95_x100,seed33_ap50_95_x100,mean_ap50_95_x100,mean_paired_delta_pp,eligible_to_win
+native,Native YOLO26n head,309656,15.351396532585,15.178894756066,15.265145644325,0.000000000000,False
+spatial_untied,Untied matched-initialization control,309656,15.304367458029,15.388949123145,15.346658290587,0.081512646262,False
+spatial_sepbn,"Shared later convolutions, separate BatchNorm",271960,15.581825924855,15.234197281775,15.408011603315,0.142865958990,True
+spatial_gn,Shared later convolutions and GroupNorm,270552,15.046610805054,14.822509064577,14.934559934816,-0.330585709510,True
+spatial_sepbn_k5,"Shared later convolutions, separate BatchNorm, 5x5",282712,15.279749129473,15.101479151419,15.190614140446,-0.074531503880,True
+spatial_sepbn_sharedpred,"Shared later convolutions, separate BatchNorm, shared predictor",246104,15.683999179032,15.278375737120,15.481187458076,0.216041813751,True
