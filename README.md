@@ -7,6 +7,14 @@
 
 A controlled comparison of detection heads on one frozen YOLO26n trunk. The native head gives P, M and G their own weights. The selected head, `spatial_sepbn_sharedpred`, shares the compatible convolution kernels in the second block and the predictor kernels across the three scales, while each scale keeps its own BatchNorm. On the development split the paired difference is **+0.319 AP50:95 points** (15.492 versus 15.173, ×100), positive in 5 of 5 seeds, with **246,104** unique head parameters against **309,656**. Counted ConvMACs do not change. This page reports that development comparison. It is not a COCO val2017 result.
 
+## The head at a glance
+
+<p align="center">
+  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n native head beside spatial_sepbn_sharedpred, drawn like the looped-head figure. Top: P, M and G each run their own two blocks and predictor. Bottom: each scale keeps its own first block; its blue, orange or green lane ends on its own bar of a three-bar stack, P over M over G, the three maps kept separate. The stack passes through one dashed purple region holding one shared box block (conv 3×3, 16 ch), the shared class blocks DW 3×3 then PW 1×1 (80 ch) and the shared 1×1 predictors, each drawn once, and leaves as a stack again: one output map per scale. BatchNorm and predictor bias stay per scale. No loop.">
+</p>
+
+**Reading the figure:** the layout is the looped-head figure's, without the loop. Each purple block is drawn once and its weights are used by P, M and G. Where the looped figure flattened all points into one list, the coloured lanes here end on a stack of three separate bars, one per map: each map gets the same weights, but the maps are never concatenated, summed or fed back. The bars keep their scale colours because BatchNorm after each shared kernel and the predictor bias stay per scale. Sharing changes **which weights the operations use**, not the number of operations.
+
 ## How this differs from the looped head
 
 **This is a separate, non-recurrent follow-up, not an improved version of the loop.** Weight sharing and recurrence are different choices: different scales can use the same kernel without sending an output back through it.
@@ -97,11 +105,7 @@ We did not isolate those mechanisms. The two-seed screen is not enough to attrib
 
 ## Architecture
 
-<p align="center">
-  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n native head beside spatial_sepbn_sharedpred, drawn like the looped-head figure. Top: P, M and G each run their own two blocks and predictor. Bottom: each scale keeps its own first block; its blue, orange or green lane ends on its own bar of a three-bar stack, P over M over G, the three maps kept separate. The stack passes through one dashed purple region holding one shared box block (conv 3×3, 16 ch), the shared class blocks DW 3×3 then PW 1×1 (80 ch) and the shared 1×1 predictors, each drawn once, and leaves as a stack again: one output map per scale. BatchNorm and predictor bias stay per scale. No loop.">
-</p>
-
-**Reading the figure:** the layout is the looped-head figure's, without the loop. Each purple block is drawn once and its weights are used by P, M and G. Where the looped figure flattened all points into one list, the coloured lanes here end on a stack of three separate bars, one per map: each map gets the same weights, but the maps are never concatenated, summed or fed back. The bars keep their scale colours because BatchNorm after each shared kernel and the predictor bias stay per scale. Sharing changes **which weights the operations use**, not the number of operations.
+The figure near the top of this page ([The head at a glance](#the-head-at-a-glance)) draws these heads.
 
 YOLO26n detects from three maps. P is 64 channels at 64×64, M is 128 channels at 32×32, and G is 256 channels at 16×16, at 512 px. Each map has a box branch and a class branch. The detector also has a second internal copy of those branches, the one-to-one head. The figure draws the one-to-many copy. The one-to-one copy has the same pattern and its own weights. Nothing is shared across box and class, or across the two copies.
 
