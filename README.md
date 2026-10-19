@@ -98,10 +98,10 @@ We did not isolate those mechanisms. The two-seed screen is not enough to attrib
 ## Architecture
 
 <p align="center">
-  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n native and non-recurrent spatial-sharing heads. P, M and G retain separate feature-map paths. Each shared weight is one purple rectangle with dashed weight-reference links to its three circular application glyphs. Solid grey lines carry features, not weights. Second-block and predictor weights are shared across scales within each branch family; first blocks, BatchNorm and predictor biases stay scale-specific. Box and class remain separate. No feature-map merging or recurrence.">
+  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n native head beside spatial_sepbn_sharedpred, drawn like the looped-head figure. Top: P, M and G each run their own two blocks and predictor. Bottom: each scale keeps its own first block, then its blue, orange or green lane enters one dashed purple region holding one shared box block (conv 3×3, 16 ch), one shared class block (DW 3×3 + PW 1×1, 80 ch) and the shared 1×1 predictors. The lanes enter and leave each purple block separately, so the maps are never merged. BatchNorm and predictor bias stay per scale. No loop.">
 </p>
 
-**Reading the figure:** a purple rectangle is one stored weight tensor; circles are its three separate applications. Dashed purple links explicitly connect that one tensor to its applications on P, M and G. Solid grey lines carry each scale's features, which never merge. Sharing changes **which weights the operations use**, not the number of operations.
+**Reading the figure:** the layout is the looped-head figure's, without the loop. Each purple block is drawn once and its weights are used by P, M and G. The three coloured lanes pass through it separately: each map gets the same weights, but the maps are never concatenated, summed or fed back. The lanes keep their scale colours because BatchNorm after each shared kernel and the predictor bias stay per scale. Sharing changes **which weights the operations use**, not the number of operations.
 
 YOLO26n detects from three maps. P is 64 channels at 64×64, M is 128 channels at 32×32, and G is 256 channels at 16×16, at 512 px. Each map has a box branch and a class branch. The detector also has a second internal copy of those branches, the one-to-one head. The figure draws the one-to-many copy. The one-to-one copy has the same pattern and its own weights. Nothing is shared across box and class, or across the two copies.
 
