@@ -98,10 +98,10 @@ We did not isolate those mechanisms. The two-seed screen is not enough to attrib
 ## Architecture
 
 <p align="center">
-  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n native and non-recurrent spatial-sharing heads. P, M and G retain separate feature-map paths. Solid purple chips identify unique stored weights; matching dashed blocks show independent applications, not extra weight copies. Second-block and predictor weights are shared across scales within each branch family; first blocks, BatchNorm and predictor biases stay scale-specific. Box and class remain separate. No feature-map merging or recurrence.">
+  <img src="assets/shared-spatial-head.png" width="100%" alt="YOLO26n native and non-recurrent spatial-sharing heads. P, M and G retain separate feature-map paths. Each shared weight is one purple rectangle with dashed weight-reference links to its three circular application glyphs. Solid grey lines carry features, not weights. Second-block and predictor weights are shared across scales within each branch family; first blocks, BatchNorm and predictor biases stay scale-specific. Box and class remain separate. No feature-map merging or recurrence.">
 </p>
 
-**Reading the figure:** a solid purple chip is one stored weight tensor. Matching dashed blocks are its applications on separate maps, not additional copies of the weights. The P, M and G paths never merge.
+**Reading the figure:** a purple rectangle is one stored weight tensor; circles are its three separate applications. Dashed purple links explicitly connect that one tensor to its applications on P, M and G. Solid grey lines carry each scale's features, which never merge. Sharing changes **which weights the operations use**, not the number of operations.
 
 YOLO26n detects from three maps. P is 64 channels at 64×64, M is 128 channels at 32×32, and G is 256 channels at 16×16, at 512 px. Each map has a box branch and a class branch. The detector also has a second internal copy of those branches, the one-to-one head. The figure draws the one-to-many copy. The one-to-one copy has the same pattern and its own weights. Nothing is shared across box and class, or across the two copies.
 

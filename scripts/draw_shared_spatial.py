@@ -29,15 +29,16 @@ SHARED = "#7B4FC9"
 INK, GREY, LINE, RULE = "#1F2430", "#6B7280", "#9CA3AF", "#E5E7EB"
 TEAL = "#0F766E"
 H80 = 9.0                                   # drawn height of 80 channels, as in draw_looped_head.py
-DASH = (0, (3, 2))
 
 
 def H(ch: float) -> float:
     return H80 * ch / 80                    # block height is proportional to channels
 
 
-def box(ax, x, y, w, h, color, text="", fs=9, alpha=0.22, lw=1.6, bold=False, tc=INK, ls="-"):
+def box(ax, x, y, w, h, color, text="", fs=9, alpha=0.22, lw=1.6, bold=False, tc=INK, ls="-", opaque=False):
     style = "round,pad=0.15,rounding_size=0.5"
+    if opaque:  # hides a lane line that runs behind a translucent block
+        ax.add_patch(FancyBboxPatch((x, y - h / 2), w, h, boxstyle=style, fc="white", ec="none", zorder=1.9))
     ax.add_patch(FancyBboxPatch((x, y - h / 2), w, h, boxstyle=style, fc=color, ec="none", alpha=alpha, zorder=2))
     ax.add_patch(FancyBboxPatch((x, y - h / 2), w, h, boxstyle=style, fc="none", ec=color, lw=lw, ls=ls, zorder=2.2))
     if text:
@@ -75,32 +76,43 @@ def bias_dot(ax, cx, y, color):
 
 
 def chip_width(label):
-    return 0.78 * len(label) + 2.4
+    return 0.78 * max(len(line) for line in label.split("\n")) + 2.4
 
 
-def weight_chip(ax, x, y, label):
-    """The one authoritative object for a stored weight tensor."""
+def weight_chip(ax, cx, y, label):
+    """A stored weight tensor: the only purple rectangle, drawn once per tensor."""
     w = chip_width(label)
-    ax.add_patch(FancyBboxPatch((x, y - 1.5), w, 3.0, boxstyle="round,pad=0.02,rounding_size=0.5",
+    h = 3.0 if "\n" not in label else 5.0
+    ax.add_patch(FancyBboxPatch((cx - w / 2, y - h / 2), w, h, boxstyle="round,pad=0.02,rounding_size=0.5",
                                 fc=SHARED, ec=SHARED, lw=0, zorder=3))
-    ax.text(x + w / 2, y, label, ha="center", va="center", fontsize=7.5, color="white", fontweight="bold", zorder=4)
-    return w
+    ax.text(cx, y, label, ha="center", va="center", fontsize=7.5, color="white", fontweight="bold", zorder=4,
+            linespacing=1.15)
+    return h
 
 
-def chip_row(ax, x0, x1, y, labels):
-    widths = [chip_width(t) for t in labels]
-    gap = 1.2
-    x = (x0 + x1) / 2 - (sum(widths) + gap * (len(labels) - 1)) / 2
-    for text, w in zip(labels, widths):
-        weight_chip(ax, x, y, text)
-        x += w + gap
+def application(ax, cx, y):
+    """One execution of a stored weight on one scale's map: a ring, never a rectangle."""
+    ax.add_patch(Circle((cx, y), 1.4, fc="white", ec=SHARED, lw=1.5, zorder=3))
+
+
+# One entry per shared tensor in the drawn internal copy: (x of its three applications, label, side).
+# Box tensors sit above the lanes and class tensors below, so each weight link runs straight
+# to its applications without sharing a column with any other tensor or any BN tag.
+SHARED_WEIGHTS = {
+    "box3x3": (38, "box 3\u00d73", "top"),
+    "classdw": (45, "class DW\n3\u00d73", "bottom"),
+    "classpw": (58, "class PW\n1\u00d71", "bottom"),
+    "boxpred": (77, "box 1\u00d71", "top"),
+    "classpred": (83, "class 1\u00d71", "bottom"),
+}
 
 
 def draw_architecture() -> None:
     """Native head against spatial_sepbn_sharedpred, one internal copy, no recurrence.
 
-    Each scale keeps its own map end to end. A purple dashed block is one application of a
-    weight tensor stored once; a solid scale-coloured tag (BN, bias) is never shared.
+    Each scale keeps its own map end to end (solid grey lanes). A purple rectangle is a weight
+    tensor stored once; dashed purple links run from it to the three rings where P, M and G
+    each apply it. BN tags and bias dots are solid scale colours and never shared.
     """
     fig, ax = plt.subplots(figsize=(15.4, 19.6), dpi=150)
     ax.set_xlim(0, 154)
@@ -111,8 +123,8 @@ def draw_architecture() -> None:
 
     ax.text(CX, 193, "YOLO26n detection head: native vs. shared spatial weights", ha="center", va="center",
             fontsize=19, fontweight="bold", color=INK)
-    ax.text(CX, 189, "block height = number of channels   \u00b7   blue / orange / green = weights of one scale   \u00b7   "
-            "purple = weights stored once, applied at P, M and G", ha="center", va="center", fontsize=10.5, color=GREY)
+    ax.text(CX, 189, "block height = number of channels (coloured rectangles)   \u00b7   blue / orange / green = weights of one scale"
+            "   \u00b7   purple = weights stored once", ha="center", va="center", fontsize=10.5, color=GREY)
     ax.text(CX, 185.7, "one internal copy is drawn (one-to-many)  \u00b7  the one-to-one copy has the same pattern with its own weights",
             ha="center", va="center", fontsize=10, color=GREY)
 
@@ -120,9 +132,11 @@ def draw_architecture() -> None:
         ax.text(CX, y, title, ha="center", fontsize=15, fontweight="bold", color=INK)
         ax.text(CX, y - 3.6, subtitle, ha="center", fontsize=10.5, color=GREY)
 
-    def note(x, y, head, body, grey=False):
+    def note(x, y, head, body):
         ax.text(x, y, head, fontsize=10, color=INK, fontweight="bold")
-        ax.text(x, y - 1.7, body, fontsize=9.3, color=GREY if grey else INK, va="top", linespacing=1.4)
+        ax.text(x, y - 1.7, body, fontsize=9.3, color=INK, va="top", linespacing=1.4)
+
+    uses = {name: [] for name in SHARED_WEIGHTS}
 
     def scale_lanes(g, s, shared):
         """One scale: its input card once, then the box lane (thin) and class lane (tall)."""
@@ -133,35 +147,26 @@ def draw_architecture() -> None:
         arrow(ax, (17.3, g - 1), (22.8, yc))
         box(ax, 23, yb, 7, H(16), c, alpha=0.55)
         box(ax, 23, yc, 7, H(80), c, alpha=0.28)
+        seg(ax, [30.4, 94.2], [yb, yb])
+        seg(ax, [30.4, 94.2], [yc, yc])
 
-        def block(x, y, h, letter, w=7):
-            if shared:  # application of a stored weight: dashed purple, never solid
-                box(ax, x, y, w, h, SHARED, letter, fs=7.5, alpha=0.14, lw=1.3, bold=True, tc=SHARED, ls="--")
+        def op(name, y, native_x, native_h):
+            if shared:
+                application(ax, SHARED_WEIGHTS[name][0], y)
+                uses[name].append(y)
             else:
-                box(ax, x, y, w, h, c, alpha=0.55 if y == yb else 0.28)
+                box(ax, native_x, y, 7, native_h, c, alpha=0.55 if y == yb else 0.28, opaque=True)
 
-        seg(ax, [30.4, 38.8], [yb, yb])
-        block(39, yb, H(16), "a")
-        seg(ax, [46.2, 48.1], [yb, yb])
-        bn_tag(ax, 50, yb, c)
-        seg(ax, [51.9, 79.3], [yb, yb])
-        block(79.5, yb, H(4), "")  # 4 output channels: too thin to hold its letter
-        if shared:
-            ax.text(83, yb + 1.7, "d", ha="center", va="center", fontsize=7.5, color=SHARED, fontweight="bold")
-
-        seg(ax, [30.4, 38.8], [yc, yc])
-        block(39, yc, H(80), "b")
-        seg(ax, [46.2, 48.1], [yc, yc])
-        bn_tag(ax, 50, yc, c)
-        seg(ax, [51.9, 53.3], [yc, yc])
-        block(53.5, yc, H(80), "c")
-        seg(ax, [60.7, 62.2], [yc, yc])
-        bn_tag(ax, 64.1, yc, c)
-        seg(ax, [66, 79.3], [yc, yc])
-        block(79.5, yc, H(80), "e")
+        op("box3x3", yb, 39, H(16))
+        bn_tag(ax, 51 if shared else 50, yb, c)
+        op("boxpred", yb, 79.5, H(4))
+        op("classdw", yc, 39, H(80))
+        bn_tag(ax, 51 if shared else 50, yc, c)
+        op("classpw", yc, 53.5, H(80))
+        bn_tag(ax, 65 if shared else 64.1, yc, c)
+        op("classpred", yc, 79.5, H(80))
 
         for y in (yb, yc):
-            seg(ax, [86.7, 94.2], [y, y])
             bias_dot(ax, 95.4, y, c)
             seg(ax, [96.7, 102], [y, g])
         arrow(ax, (102, g), (105.4, g))
@@ -189,38 +194,45 @@ def draw_architecture() -> None:
             "not looped  \u00b7  the three maps stay separate  \u00b7  BatchNorm and predictor bias stay per scale")
     ax.text(26.5, T2 - 10.5, "block 1 \u00b7 own", ha="center", fontsize=9, color=GREY)
     ax.text(97.5, T2 - 10.5, "own bias", ha="center", fontsize=9, color=GREY)
-    top, bottom = T2 - 8, T2 - 66.5
-    for x0, x1, title in ((34, 70, "block 2 \u00b7 shared kernels"), (73.5, 92.5, "predictor weight")):
-        ax.add_patch(FancyBboxPatch((x0, bottom), x1 - x0, top - bottom, boxstyle="round,pad=0.2,rounding_size=1.5",
-                                    fc="#F6F2FD", ec=SHARED, lw=1.2, ls="--", zorder=0.8))
-        ax.text((x0 + x1) / 2, top - 2.4, title, ha="center", fontsize=9.5, color=SHARED, fontweight="bold")
-    for s, dy in (("P", -21), ("M", -37), ("G", -53)):
+    for s, dy in (("P", -22.5), ("M", -38.5), ("G", -54.5)):
         scale_lanes(T2 + dy, s, shared=True)
-    chip_row(ax, 34, 70, T2 - 63.3, ["a box 3\u00d73", "b class DW", "c class PW"])
-    chip_row(ax, 73.5, 92.5, T2 - 63.3, ["d box", "e class"])
+
+    # One weight object per tensor, one dashed link to each of its three applications.
+    top_y, bottom_y = T2 - 10.5, T2 - 67
+    for name, (x, label, side) in SHARED_WEIGHTS.items():
+        y0 = top_y if side == "top" else bottom_y
+        h = weight_chip(ax, x, y0, label)
+        far = max(uses[name]) if side == "bottom" else min(uses[name])
+        start = y0 - h / 2 if side == "top" else y0 + h / 2
+        ax.plot([x, x], [start, far], color=SHARED, lw=1.5, ls="--", zorder=1.7, dash_capstyle="butt")
+    ax.text(57, top_y, "box weights, stored once", ha="center", va="center", fontsize=8.5, color=SHARED)
+    ax.text(38, bottom_y, "class weights,\nstored once", ha="right", va="center", fontsize=8.5, color=SHARED,
+            linespacing=1.2)
 
     note(123, T2 - 14.5, "one kernel, three maps",
-         "each stored tensor is applied to the\nP, M and G maps separately, with\nthe same weight values")
+         "each purple weight is applied to the\nP, M and G maps separately, with\nthe same weight values")
     note(123, T2 - 26, "still per scale", "block 1, every BatchNorm and the\npredictor bias")
     note(123, T2 - 35.5, "not tied to each other", "box and class families, and the\none-to-many and one-to-one heads")
     note(123, T2 - 44.5, "no recurrence", "no loop, feedback, concat or sum of\nthe P, M and G maps")
 
-    ly = T2 - 71.5
-    weight_chip(ax, 5, ly, "stored weight")
-    ax.text(5 + chip_width("stored weight") + 1.2, ly, "one tensor, drawn once", va="center", fontsize=8.5, color=GREY)
-    box(ax, 44, ly, 7, 2.4, SHARED, "x", fs=7, alpha=0.14, lw=1.2, bold=True, tc=SHARED, ls="--")
-    ax.text(52.5, ly, "one application of it, on one scale's map", va="center", fontsize=8.5, color=GREY)
-    bn_tag(ax, 93, ly, SCALE["M"])
-    ax.text(95.6, ly, "per-scale BN", va="center", fontsize=8.5, color=GREY)
-    bias_dot(ax, 110.5, ly, SCALE["M"])
-    ax.text(112.2, ly, "bias", va="center", fontsize=8.5, color=GREY)
+    ly = T2 - 73.5
+    weight_chip(ax, 8, ly, "weight")
+    ax.text(12.5, ly, "stored weight, drawn once", va="center", fontsize=8.5, color=GREY)
+    ax.plot([37, 43], [ly, ly], color=SHARED, lw=1.5, ls="--")
+    ax.text(44.2, ly, "dashed link = uses this weight", va="center", fontsize=8.5, color=GREY)
+    application(ax, 70, ly)
+    ax.text(72.2, ly, "one application on one scale", va="center", fontsize=8.5, color=GREY)
+    bn_tag(ax, 99, ly, SCALE["M"])
+    ax.text(101.6, ly, "per-scale BN", va="center", fontsize=8.5, color=GREY)
+    bias_dot(ax, 114, ly, SCALE["M"])
+    ax.text(115.7, ly, "bias", va="center", fontsize=8.5, color=GREY)
     arrow(ax, (123, ly), (129, ly))
-    ax.text(130.2, ly, "lanes stay per scale", va="center", fontsize=8.5, color=GREY)
+    ax.text(130.2, ly, "grey = feature path", va="center", fontsize=8.5, color=GREY)
 
-    ax.text(CX, T2 - 76.4,
-            "The P, M and G maps (64 ch 64\u00d764, 128 ch 32\u00d732, 256 ch 16\u00d716 at 512 px) stay separate: the same stored "
-            "kernel is applied to each one on its own.\n"
-            "Class block 2 stores two tensors, b (depthwise 3\u00d73) and c (pointwise 1\u00d71), each followed by its own per-scale BN. "
+    ax.text(CX, T2 - 77.2,
+            "Each purple weight is stored once and used by P, M and G on their own separate maps: nothing is concatenated, "
+            "summed or looped.\n"
+            "Class block 2 has two weights (DW 3\u00d73, PW 1\u00d71), each followed by its own per-scale BN. "
             "The predictor shares its weight, not its bias.",
             ha="center", va="top", fontsize=9, color=GREY, linespacing=1.5)
     seg(ax, [5, 151], [27.8, 27.8], RULE, 1.2)
